@@ -276,9 +276,9 @@ def main(args):
     model = UltrasoundDenoiser(
         history_len=HISTORY_LEN,
         pose_dim=7,
-        cond_channels=2048,  # Large config for high quality
-        channels=[128, 256, 512, 1024],
-        depths=[2, 2, 2, 2],
+        cond_channels=4096,  # Large config for high quality
+        channels=[320, 640, 1280, 1280],
+        depths=[3, 4, 4, 3],
         attn_depths=[False, False, True, True]
     ).to(DEVICE)  # No .half() - keep FP32 params; autocast handles FP16 compute
     
