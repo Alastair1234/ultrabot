@@ -12,6 +12,7 @@ from torch import nn, optim
 from tqdm import tqdm
 from scipy.spatial.transform import Rotation as R
 from matplotlib.backends.backend_pdf import PdfPages
+import subprocess  # New: For querying nvidia-smi
 
 import warnings  # For suppressing warnings
 from torch.amp import GradScaler, autocast  # Updated for PyTorch 2.5+
@@ -27,7 +28,7 @@ torch.backends.cudnn.benchmark = True
 HISTORY_LEN = 4  
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SIGMA_DATA = 0.5 
-IMAGE_SIZE = (256, 256)  # New: Resize images to this for memory savings (adjust lower if OOM)
+IMAGE_SIZE = (256, 256)  # Resize images to this for memory savings (adjust lower if OOM)
 
 class CTSequenceDataset(Dataset):
     """
@@ -77,15 +78,15 @@ class CTSequenceDataset(Dataset):
         def load_img(pt):
             path = os.path.join(images_dir, pt['FileName'])
             img = cv2.imread(path)
-            img = cv2.resize(img, IMAGE_SIZE)  # New: Resize for memory savings
+            img = cv2.resize(img, IMAGE_SIZE)  # Resize for memory savings
             img = (cv2.cvtColor(img, cv2.COLOR_BGR2RGB) / 255.0) * 2.0 - 1.0
-            return torch.tensor(img).permute(2, 0, 1).float()  # Fixed: To float (FP32); autocast handles FP16
+            return torch.tensor(img).permute(2, 0, 1).float()  # To float (FP32); autocast handles FP16
 
         for i in range(HISTORY_LEN):
             img = load_img(sequence_points[i])
             delta = self._calc_delta_pose(sequence_points[i], sequence_points[i+1])
             context_imgs.append(img)
-            context_deltas.append(torch.tensor(delta, dtype=torch.float))  # Fixed: To float (FP32)
+            context_deltas.append(torch.tensor(delta, dtype=torch.float))  # To float (FP32)
 
         target_img = load_img(sequence_points[HISTORY_LEN])
         return torch.stack(context_imgs), torch.stack(context_deltas), target_img
@@ -96,7 +97,7 @@ def get_karras_conditioners(sigmas):
     c_in = 1 / (sigmas**2 + SIGMA_DATA**2).sqrt()
     return c_skip, c_out, c_in
 
-def train_epoch(model, loader, criterion, optimizer, scaler, accum_steps=4):  # New: accum_steps param
+def train_epoch(model, loader, criterion, optimizer, scaler, accum_steps=4):
     model.train()
     total_loss = 0
     for batch_idx, (context_imgs, context_deltas, target_img) in enumerate(tqdm(loader, desc='Training', leave=False)):
@@ -115,11 +116,11 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accum_steps=4):  # 
         with autocast(device_type='cuda', dtype=torch.float16):  # Updated
             model_output = model(context_imgs, context_deltas, noisy_target_img * c_in, sigmas)
             target_for_loss = (target_img - c_skip * noisy_target_img) / c_out
-            loss = criterion(model_output, target_for_loss) / accum_steps  # New: Normalize loss for accum
+            loss = criterion(model_output, target_for_loss) / accum_steps  # Normalize loss for accum
             
         scaler.scale(loss).backward()
         
-        # New: Gradient accumulation
+        # Gradient accumulation
         if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(loader):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
@@ -128,20 +129,35 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accum_steps=4):  # 
         
         total_loss += loss.item() * accum_steps  # Adjust back for reporting
         
-    torch.cuda.empty_cache()  # New: Clear after epoch
-    print(f"Peak memory usage: {torch.cuda.max_memory_allocated(DEVICE) / 1e9:.2f} GB")  # New: Track peak VRAM
-    return total_loss / len(loader)
+    torch.cuda.empty_cache()  # Clear after epoch
+    peak_mem = torch.cuda.max_memory_allocated(DEVICE) / 1e9
+    print(f"Peak memory usage: {peak_mem:.2f} GB")
+    return total_loss / len(loader), peak_mem  # Updated: Return peak_mem for PDF
 
 def denormalize_img(img_tensor):
     img = (img_tensor.clamp(-1, 1) + 1) / 2.0
     img = img.permute(1, 2, 0).cpu().numpy()
     return (img * 255).astype(np.uint8)
 
+# New: Function to get GPU stats from nvidia-smi
+def get_gpu_stats():
+    try:
+        output = subprocess.check_output(['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu', '--format=csv,noheader']).decode('utf-8').strip()
+        util, mem_used, mem_total, power, temp = output.split(', ')
+        return {
+            'GPU Util': util.strip(),
+            'Memory': f"{mem_used.strip()} / {mem_total.strip()}",
+            'Power': power.strip(),
+            'Temp': temp.strip()
+        }
+    except Exception as e:
+        return {'Error': str(e)}
+
 @torch.no_grad()
-def sample_k_diffusion(model, context_imgs, context_deltas, num_steps=20, sigma_max=20.0, sigma_min=0.002, rho=7.0, sub_batch_size=1):  # New: sub_batch_size for memory
+def sample_k_diffusion(model, context_imgs, context_deltas, num_steps=20, sigma_max=20.0, sigma_min=0.002, rho=7.0, sub_batch_size=1):
     model.eval()
     generated = []
-    for i in range(0, context_imgs.shape[0], sub_batch_size):  # New: Process in sub-batches
+    for i in range(0, context_imgs.shape[0], sub_batch_size):  # Process in sub-batches
         sub_imgs = context_imgs[i:i+sub_batch_size]
         sub_deltas = context_deltas[i:i+sub_batch_size]
         B, _, C, H, W = sub_imgs.shape
@@ -172,7 +188,7 @@ def sample_k_diffusion(model, context_imgs, context_deltas, num_steps=20, sigma_
     return torch.cat(generated)
 
 @torch.no_grad()
-def eval_and_plot(model, loader, epoch, save_dir):
+def eval_and_plot(model, loader, epoch, save_dir, train_loss, peak_mem):  # Updated: Pass train_loss and peak_mem
     model.eval()
     os.makedirs(save_dir, exist_ok=True)
     pdf_path = os.path.join(save_dir, f'generated_epoch_{epoch}.pdf')
@@ -185,7 +201,7 @@ def eval_and_plot(model, loader, epoch, save_dir):
 
     context_imgs, context_deltas = context_imgs.to(DEVICE), context_deltas.to(DEVICE)
     
-    generated_img = sample_k_diffusion(model, context_imgs, context_deltas, sub_batch_size=1)  # New: Low sub-batch for memory
+    generated_img = sample_k_diffusion(model, context_imgs, context_deltas, sub_batch_size=1)  # Low sub-batch for memory
 
     with PdfPages(pdf_path) as pdf:
         for i in range(min(context_imgs.shape[0], 5)):
@@ -207,7 +223,25 @@ def eval_and_plot(model, loader, epoch, save_dir):
             
             pdf.savefig(fig)
             plt.close(fig)
-    torch.cuda.empty_cache()  # New: Clear after eval
+        
+        # New: Add GPU stats page
+        stats = get_gpu_stats()
+        stats_text = f"Epoch {epoch} GPU Stats:\n" \
+                     f"Train Loss: {train_loss:.4f}\n" \
+                     f"Peak Memory: {peak_mem:.2f} GB\n" \
+                     f"GPU Util: {stats.get('GPU Util', 'N/A')}\n" \
+                     f"Memory Usage: {stats.get('Memory', 'N/A')}\n" \
+                     f"Power Draw: {stats.get('Power', 'N/A')}\n" \
+                     f"GPU Temp: {stats.get('Temp', 'N/A')}"
+        
+        fig_stats = plt.figure(figsize=(8, 6))
+        plt.text(0.1, 0.5, stats_text, fontsize=12, va='center')
+        plt.axis('off')
+        plt.title(f"Epoch {epoch} Performance Stats")
+        pdf.savefig(fig_stats)
+        plt.close(fig_stats)
+    
+    torch.cuda.empty_cache()  # Clear after eval
 
 # =================================================================================
 #                                --- MAIN SCRIPT ---
@@ -231,7 +265,7 @@ def main(args):
     if len(val_dataset) == 0:
         print("Warning: Validation dataset is empty. Check data paths.")
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=False, persistent_workers=False)  # New: Lower workers, no persistent
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=False, persistent_workers=False)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, drop_last=False, persistent_workers=False)
 
     model = UltrasoundDenoiser(
@@ -246,7 +280,7 @@ def main(args):
         # channels=[128, 256, 512, 1024],
         # depths=[2, 2, 2, 2],
         # attn_depths=[False, False, True, True]
-    ).to(DEVICE)  # Fixed: No .half() - keep FP32 params; autocast handles FP16 compute
+    ).to(DEVICE)  # No .half() - keep FP32 params; autocast handles FP16 compute
     
     print(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
 
@@ -254,29 +288,29 @@ def main(args):
     criterion = nn.MSELoss()
     
     if DEVICE.type == 'cuda':
-        scaler = GradScaler(device='cuda', init_scale=65536)  # Fixed: Higher init_scale for FP16 stability
+        scaler = GradScaler(device='cuda', init_scale=65536)  # Higher init_scale for FP16 stability
     else:
         scaler = GradScaler()
         print("Warning: Running on CPU - mixed precision disabled.")
 
     for epoch in range(1, args.epochs + 1):
         print(f"\n--- Epoch {epoch}/{args.epochs} ---")
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, scaler, accum_steps=4)  # New: Pass accum_steps
+        train_loss, peak_mem = train_epoch(model, train_loader, criterion, optimizer, scaler, accum_steps=4)  # Updated: Get peak_mem
         print(f"Epoch {epoch} - Average Training Loss: {train_loss:.4f}")
 
         if (epoch % args.checkpoint_freq == 0 or epoch == args.epochs) and len(val_loader) > 0:
             print("Running validation and plotting...")
-            eval_and_plot(model, val_loader, epoch, output_dir)
+            eval_and_plot(model, val_loader, epoch, output_dir, train_loss, peak_mem)  # Updated: Pass loss and mem
             
             torch.save(model.state_dict(), os.path.join(output_dir, f"model_epoch_{epoch}.pth"))
             print(f"Checkpoint saved for epoch {epoch}.")
-        torch.cuda.empty_cache()  # New: Clear after each epoch
+        torch.cuda.empty_cache()  # Clear after each epoch
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train a diffusion model for ultrasound sequence prediction.")
     parser.add_argument('--data_root', default='./ct_data_random_angle', help="Root directory of the CT data")
     parser.add_argument('--epochs', default=100, type=int)
-    parser.add_argument('--batch_size', default=1, type=int, help="Batch size. Lower if you run out of VRAM.")  # New: Default to 1
+    parser.add_argument('--batch_size', default=1, type=int, help="Batch size. Lower if you run out of VRAM.")
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--sequences_per_patient', default=1000, type=int, help="How many sequences to sample from each patient for training")
     parser.add_argument('--val_sequences', default=100, type=int, help="How many sequences to sample from each patient for validation")
