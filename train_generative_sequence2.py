@@ -131,7 +131,7 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accum_steps=8):  # 
         
     torch.cuda.empty_cache()  # Clear after epoch
     peak_mem = torch.cuda.max_memory_allocated(DEVICE) / 1e9
-    print(f"Peak memory usage: {peak_mem:.2f} GBールの")
+    print(f"Peak memory usage: {peak_mem:.2f} GB")
     return total_loss / len(loader), peak_mem  # Return peak_mem for PDF
 
 def denormalize_img(img_tensor):
@@ -270,7 +270,7 @@ def main(args):
         print("Warning: Validation dataset is empty. Check data paths.")
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=False, persistent_workers=False)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory-trans=True, drop_last=False, persistent_workers=False)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, drop_last=False, persistent_workers=False)
 
     model = UltrasoundDenoiser(
         history_len=HISTORY_LEN,
