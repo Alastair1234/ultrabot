@@ -104,7 +104,7 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accum_steps=8):  # 
         context_imgs, context_deltas, target_img = (
             context_imgs.to(DEVICE), context_deltas.to(DEVICE), target_img.to(DEVICE)
         )
-        desensit        optimizer.zero_grad()  # Zero at start of accum cycle
+        optimizer.zero_grad()  # Zero at start of accum cycle
         
         sigmas = (torch.randn(target_img.shape[0], device=DEVICE) * 1.2 - 1.2).exp() 
         noise = torch.randn_like(target_img)
