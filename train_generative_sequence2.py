@@ -12,7 +12,7 @@ from torch import nn, optim
 from tqdm import tqdm
 from scipy.spatial.transform import Rotation as R
 from matplotlib.backends.backend_pdf import PdfPages
-import subprocess  # New: For querying nvidia-smi
+import subprocess  # For querying nvidia-smi
 
 import warnings  # For suppressing warnings
 from torch.amp import GradScaler, autocast  # Updated for PyTorch 2.5+
@@ -132,14 +132,14 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accum_steps=4):
     torch.cuda.empty_cache()  # Clear after epoch
     peak_mem = torch.cuda.max_memory_allocated(DEVICE) / 1e9
     print(f"Peak memory usage: {peak_mem:.2f} GB")
-    return total_loss / len(loader), peak_mem  # Updated: Return peak_mem for PDF
+    return total_loss / len(loader), peak_mem  # Return peak_mem for PDF
 
 def denormalize_img(img_tensor):
     img = (img_tensor.clamp(-1, 1) + 1) / 2.0
     img = img.permute(1, 2, 0).cpu().numpy()
     return (img * 255).astype(np.uint8)
 
-# New: Function to get GPU stats from nvidia-smi
+# Function to get GPU stats from nvidia-smi
 def get_gpu_stats():
     try:
         output = subprocess.check_output(['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu', '--format=csv,noheader']).decode('utf-8').strip()
@@ -188,10 +188,11 @@ def sample_k_diffusion(model, context_imgs, context_deltas, num_steps=20, sigma_
     return torch.cat(generated)
 
 @torch.no_grad()
-def eval_and_plot(model, loader, epoch, save_dir, train_loss, peak_mem):  # Updated: Pass train_loss and peak_mem
+def eval_and_plot(model, loader, epoch, run_timestamp, train_loss, peak_mem):  # Updated: Use run_timestamp for filenames
     model.eval()
-    os.makedirs(save_dir, exist_ok=True)
-    pdf_path = os.path.join(save_dir, f'generated_epoch_{epoch}.pdf')
+    pdf_dir = './pdf_outputs'
+    os.makedirs(pdf_dir, exist_ok=True)
+    pdf_path = os.path.join(pdf_dir, f'generated_epoch_{epoch}_{run_timestamp}.pdf')
     
     try:
         context_imgs, context_deltas, target_img = next(iter(loader))
@@ -224,7 +225,7 @@ def eval_and_plot(model, loader, epoch, save_dir, train_loss, peak_mem):  # Upda
             pdf.savefig(fig)
             plt.close(fig)
         
-        # New: Add GPU stats page
+        # Add GPU stats page
         stats = get_gpu_stats()
         stats_text = f"Epoch {epoch} GPU Stats:\n" \
                      f"Train Loss: {train_loss:.4f}\n" \
@@ -251,10 +252,13 @@ def main(args):
     train_patient_dirs = [os.path.join(args.data_root, 'train', d) for d in os.listdir(os.path.join(args.data_root, 'train'))]
     val_patient_dirs = [os.path.join(args.data_root, 'val', d) for d in os.listdir(os.path.join(args.data_root, 'val'))]
     
-    output_dir = f"./training_runs_sequence/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    os.makedirs(output_dir, exist_ok=True)
+    run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    checkpoint_dir = './checkpoints'
+    os.makedirs(checkpoint_dir, exist_ok=True)  # New: Separate dir for checkpoints
     print(f"DEVICE: {DEVICE}")
-    print(f"Outputting to: {output_dir}")
+    print(f"Run Timestamp: {run_timestamp}")
+    print(f"PDFs will be saved to: ./pdf_outputs/")
+    print(f"Checkpoints will be saved to: {checkpoint_dir}/")
 
     train_dataset = CTSequenceDataset(train_patient_dirs, args.sequences_per_patient)
     val_dataset = CTSequenceDataset(val_patient_dirs, args.val_sequences, is_val=True)
@@ -295,15 +299,16 @@ def main(args):
 
     for epoch in range(1, args.epochs + 1):
         print(f"\n--- Epoch {epoch}/{args.epochs} ---")
-        train_loss, peak_mem = train_epoch(model, train_loader, criterion, optimizer, scaler, accum_steps=4)  # Updated: Get peak_mem
+        train_loss, peak_mem = train_epoch(model, train_loader, criterion, optimizer, scaler, accum_steps=4)
         print(f"Epoch {epoch} - Average Training Loss: {train_loss:.4f}")
 
         if (epoch % args.checkpoint_freq == 0 or epoch == args.epochs) and len(val_loader) > 0:
             print("Running validation and plotting...")
-            eval_and_plot(model, val_loader, epoch, output_dir, train_loss, peak_mem)  # Updated: Pass loss and mem
+            eval_and_plot(model, val_loader, epoch, run_timestamp, train_loss, peak_mem)  # Updated: Pass timestamp
             
-            torch.save(model.state_dict(), os.path.join(output_dir, f"model_epoch_{epoch}.pth"))
-            print(f"Checkpoint saved for epoch {epoch}.")
+            checkpoint_path = os.path.join(checkpoint_dir, f"model_epoch_{epoch}_{run_timestamp}.pth")  # New: Separate dir
+            torch.save(model.state_dict(), checkpoint_path)
+            print(f"Checkpoint saved: {checkpoint_path}")
         torch.cuda.empty_cache()  # Clear after each epoch
 
 if __name__ == '__main__':
