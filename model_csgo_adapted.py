@@ -169,10 +169,10 @@ class UltrasoundDenoiser(nn.Module):
             num_steps_conditioning = history_len
             num_actions = history_len * pose_dim 
             is_upsampler = False
-            cond_channels = kwargs.get("cond_channels", 2048)
-            depths = kwargs.get("depths", [2, 2, 2, 2])
-            channels = kwargs.get("channels", [128, 256, 512, 1024])
-            attn_depths = kwargs.get("attn_depths", [False, False, True, True])
+            cond_channels = kwargs.get("cond_channels", 4096)  # Upsized for richer conditioning
+            depths = kwargs.get("depths", [3, 4, 4, 3])  # Upsized for deeper features
+            channels = kwargs.get("channels", [320, 640, 1280, 1280])  # Upsized for more capacity
+            attn_depths = kwargs.get("attn_depths", [False, False, True, True])  # Kept; attention in deeper layers
 
         self.cfg = InnerModelConfig()
         self.inner_model = InnerModel(self.cfg)
