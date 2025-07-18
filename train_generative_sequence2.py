@@ -79,13 +79,13 @@ class CTSequenceDataset(Dataset):
             img = cv2.imread(path)
             img = cv2.resize(img, IMAGE_SIZE)  # New: Resize for memory savings
             img = (cv2.cvtColor(img, cv2.COLOR_BGR2RGB) / 255.0) * 2.0 - 1.0
-            return torch.tensor(img).permute(2, 0, 1).half()  # New: To float16 for memory
+            return torch.tensor(img).permute(2, 0, 1).float()  # Fixed: To float (FP32); autocast handles FP16
 
         for i in range(HISTORY_LEN):
             img = load_img(sequence_points[i])
             delta = self._calc_delta_pose(sequence_points[i], sequence_points[i+1])
             context_imgs.append(img)
-            context_deltas.append(torch.tensor(delta, dtype=torch.float16))  # New: To float16
+            context_deltas.append(torch.tensor(delta, dtype=torch.float))  # Fixed: To float (FP32)
 
         target_img = load_img(sequence_points[HISTORY_LEN])
         return torch.stack(context_imgs), torch.stack(context_deltas), target_img
@@ -246,7 +246,7 @@ def main(args):
         # channels=[128, 256, 512, 1024],
         # depths=[2, 2, 2, 2],
         # attn_depths=[False, False, True, True]
-    ).to(DEVICE).half()  # New: Model to float16 for memory
+    ).to(DEVICE)  # Fixed: No .half() - keep FP32 params; autocast handles FP16 compute
     
     print(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
 
@@ -254,7 +254,7 @@ def main(args):
     criterion = nn.MSELoss()
     
     if DEVICE.type == 'cuda':
-        scaler = GradScaler(device='cuda')  # Updated
+        scaler = GradScaler(device='cuda', init_scale=65536)  # Fixed: Higher init_scale for FP16 stability
     else:
         scaler = GradScaler()
         print("Warning: Running on CPU - mixed precision disabled.")
