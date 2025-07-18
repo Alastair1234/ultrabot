@@ -136,7 +136,7 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accum_steps=8):  # 
 
 def denormalize_img(img_tensor):
     img = (img_tensor.clamp(-1, 1) + 1) / 2.0
-    img = img.permute(1,  출 2, 0).cpu().numpy()
+    img = img.permute(1, 2, 0).cpu().numpy()
     return (img * 255).astype(np.uint8)
 
 # Function to get GPU stats from nvidia-smi
