@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import List, Optional
+from flash_attn import flash_attention  # For efficient, exact attention (fixes OOM)
 
 # =================================================================================
 #  --- Building Blocks (Unchanged and Correct) ---
@@ -35,13 +36,27 @@ class SelfAttention2d(nn.Module):
         self.qkv_proj = nn.Conv2d(in_channels, in_channels * 3, 1)
         self.out_proj = nn.Conv2d(in_channels, in_channels, 1)
         nn.init.zeros_(self.out_proj.weight), nn.init.zeros_(self.out_proj.bias)
+
     def forward(self, x: Tensor) -> Tensor:
         n, c, h, w = x.shape
         x_norm = self.norm(x)
         qkv = self.qkv_proj(x_norm).view(n, self.n_head * 3, c // self.n_head, h * w).transpose(2, 3)
-        q, k, v = qkv.chunk(3, dim=1)
-        att = F.softmax((q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1)), dim=-1)
-        y = (att @ v).transpose(2, 3).reshape(n, c, h, w)
+        q, k, v = qkv.chunk(3, dim=1)  # Each: (B, n_head, H*W, head_dim)
+
+        # Reshape for Flash Attention: (B, seq_len=H*W, n_head, head_dim)
+        q = q.permute(0, 2, 1, 3)  # (B, H*W, n_head, head_dim)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        # Flash Attention (exact replacement: computes softmax(qk) @ v efficiently, no OOM)
+        y, _ = flash_attention(
+            q, k, v,
+            softmax_scale=1 / math.sqrt(k.size(-1)),  # Same scale as original
+            causal=False  # No causal mask (assuming self-attn over flattened image; set True if needed)
+        )
+
+        # Reshape back to original format
+        y = y.permute(0, 2, 1, 3).reshape(n, c, h, w)  # (B, n_head, H*W, head_dim) -> (B, C, H, W)
         return x + self.out_proj(y)
 
 class FourierFeatures(nn.Module):

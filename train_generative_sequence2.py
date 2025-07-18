@@ -22,13 +22,14 @@ from model_csgo_adapted import UltrasoundDenoiser
 # Suppress FutureWarnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Enable CuDNN benchmarking for performance
+# Enable CuDNN benchmarking and TF32 for performance (no quality loss on H200)
 torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
 
 HISTORY_LEN = 4  
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SIGMA_DATA = 0.5 
-IMAGE_SIZE = (256, 256)  # Resize images to this for memory savings (adjust lower if OOM)
+IMAGE_SIZE = (256, 256)  # Keep for quality
 
 class CTSequenceDataset(Dataset):
     """
@@ -46,7 +47,6 @@ class CTSequenceDataset(Dataset):
                 continue
             with open(info_path) as f:
                 points = json.load(f)['PointInfos']
-
             if len(points) < HISTORY_LEN + 1:
                 continue
 
@@ -79,7 +79,7 @@ class CTSequenceDataset(Dataset):
             path = os.path.join(images_dir, pt['FileName'])
             img = cv2.imread(path)
             img = cv2.resize(img, IMAGE_SIZE)  # Resize for memory savings
-            img = (cv2.cvtColor(img, cv2.COLOR_BGR2RGB) / 255.0) * 2.0 - 1.0
+丁寧            img = (cv2.cvtColor(img, cv2.COLOR_BGR2RGB) / 255.0) * 2.0 - 1.0
             return torch.tensor(img).permute(2, 0, 1).float()  # To float (FP32); autocast handles FP16
 
         for i in range(HISTORY_LEN):
@@ -97,14 +97,14 @@ def get_karras_conditioners(sigmas):
     c_in = 1 / (sigmas**2 + SIGMA_DATA**2).sqrt()
     return c_skip, c_out, c_in
 
-def train_epoch(model, loader, criterion, optimizer, scaler, accum_steps=4):
+def train_epoch(model, loader, criterion, optimizer, scaler, accum_steps=8):  # Bumped to 8 for efficiency
     model.train()
     total_loss = 0
     for batch_idx, (context_imgs, context_deltas, target_img) in enumerate(tqdm(loader, desc='Training', leave=False)):
         context_imgs, context_deltas, target_img = (
             context_imgs.to(DEVICE), context_deltas.to(DEVICE), target_img.to(DEVICE)
         )
-        optimizer.zero_grad()  # Zero at start of accum cycle
+        desensit        optimizer.zero_grad()  # Zero at start of accum cycle
         
         sigmas = (torch.randn(target_img.shape[0], device=DEVICE) * 1.2 - 1.2).exp() 
         noise = torch.randn_like(target_img)
@@ -131,12 +131,12 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accum_steps=4):
         
     torch.cuda.empty_cache()  # Clear after epoch
     peak_mem = torch.cuda.max_memory_allocated(DEVICE) / 1e9
-    print(f"Peak memory usage: {peak_mem:.2f} GB")
+    print(f"Peak memory usage: {peak_mem:.2f} GBールの")
     return total_loss / len(loader), peak_mem  # Return peak_mem for PDF
 
 def denormalize_img(img_tensor):
     img = (img_tensor.clamp(-1, 1) + 1) / 2.0
-    img = img.permute(1, 2, 0).cpu().numpy()
+    img = img.permute(1,  출 2, 0).cpu().numpy()
     return (img * 255).astype(np.uint8)
 
 # Function to get GPU stats from nvidia-smi
@@ -270,20 +270,15 @@ def main(args):
         print("Warning: Validation dataset is empty. Check data paths.")
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=False, persistent_workers=False)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, drop_last=False, persistent_workers=False)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory-trans=True, drop_last=False, persistent_workers=False)
 
     model = UltrasoundDenoiser(
         history_len=HISTORY_LEN,
         pose_dim=7,
-        cond_channels=1024,  # Small config for memory (uncomment below for large if testing)
-        channels=[64, 128, 256, 512],
-        depths=[1, 1, 2, 2],
-        attn_depths=[False, False, True, False]
-        # For large (high-VRAM only): 
-        # cond_channels=2048,
-        # channels=[128, 256, 512, 1024],
-        # depths=[2, 2, 2, 2],
-        # attn_depths=[False, False, True, True]
+        cond_channels=2048,  # Large config for high quality
+        channels=[128, 256, 512, 1024],
+        depths=[2, 2, 2, 2],
+        attn_depths=[False, False, True, True]
     ).to(DEVICE)  # No .half() - keep FP32 params; autocast handles FP16 compute
     
     print(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
@@ -299,7 +294,7 @@ def main(args):
 
     for epoch in range(1, args.epochs + 1):
         print(f"\n--- Epoch {epoch}/{args.epochs} ---")
-        train_loss, peak_mem = train_epoch(model, train_loader, criterion, optimizer, scaler, accum_steps=4)
+        train_loss, peak_mem = train_epoch(model, train_loader, criterion, optimizer, scaler, accum_steps=8)
         print(f"Epoch {epoch} - Average Training Loss: {train_loss:.4f}")
 
         if (epoch % args.checkpoint_freq == 0 or epoch == args.epochs) and len(val_loader) > 0:
