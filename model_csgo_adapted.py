@@ -43,10 +43,10 @@ class SelfAttention2d(nn.Module):
         qkv = self.qkv_proj(x_norm).view(n, self.n_head * 3, c // self.n_head, h * w).transpose(2, 3)
         q, k, v = qkv.chunk(3, dim=1)  # Each: (B, n_head, H*W, head_dim)
 
-        # Reshape for Flash Attention: (B, H*W, n_head, head_dim)
-        q = q.permute(0, 2, 1, 3)  # (B, H*W, n_head, head_dim)
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
+        # Reshape for Flash Attention: (B, H*W, n_head, head_dim) and ensure contiguous for backward pass
+        q = q.permute(0, 2, 1, 3).contiguous()  # (B, H*W, n_head, head_dim)
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
 
         # Flash Attention (exact replacement: computes softmax(qk) @ v efficiently, no OOM)
         y = flash_attn_func(
