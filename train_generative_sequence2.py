@@ -177,7 +177,8 @@ def sample_k_diffusion(model, context_imgs, context_deltas, num_steps=20, sigma_
             c_skip, c_out, c_in = get_karras_conditioners(sigma_i)
             c_skip, c_out, c_in = [c.view(-1, 1, 1, 1) for c in (c_skip, c_out, c_in)]
 
-            model_output = model(sub_imgs, sub_deltas, x * c_in, sigma_i)
+            with autocast(device_type='cuda', dtype=torch.float16):  # Added: Ensure FP16 for Flash Attention
+                model_output = model(sub_imgs, sub_deltas, x * c_in, sigma_i)
             denoised = c_skip * x + c_out * model_output
 
             d = (x - denoised) / sigma_i.view(-1, 1, 1, 1)
