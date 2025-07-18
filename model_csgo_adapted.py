@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import List, Optional
-from flash_attn import flash_attention  # For efficient, exact attention (fixes OOM)
+from flash_attn import flash_attn_func  # Correct import for efficient, exact attention (fixes OOM)
 
 # =================================================================================
 #  --- Building Blocks (Unchanged and Correct) ---
@@ -43,13 +43,13 @@ class SelfAttention2d(nn.Module):
         qkv = self.qkv_proj(x_norm).view(n, self.n_head * 3, c // self.n_head, h * w).transpose(2, 3)
         q, k, v = qkv.chunk(3, dim=1)  # Each: (B, n_head, H*W, head_dim)
 
-        # Reshape for Flash Attention: (B, seq_len=H*W, n_head, head_dim)
+        # Reshape for Flash Attention: (B, H*W, n_head, head_dim)
         q = q.permute(0, 2, 1, 3)  # (B, H*W, n_head, head_dim)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
 
         # Flash Attention (exact replacement: computes softmax(qk) @ v efficiently, no OOM)
-        y, _ = flash_attention(
+        y = flash_attn_func(
             q, k, v,
             softmax_scale=1 / math.sqrt(k.size(-1)),  # Same scale as original
             causal=False  # No causal mask (assuming self-attn over flattened image; set True if needed)
