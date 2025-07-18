@@ -79,7 +79,7 @@ class CTSequenceDataset(Dataset):
             path = os.path.join(images_dir, pt['FileName'])
             img = cv2.imread(path)
             img = cv2.resize(img, IMAGE_SIZE)  # Resize for memory savings
-丁寧            img = (cv2.cvtColor(img, cv2.COLOR_BGR2RGB) / 255.0) * 2.0 - 1.0
+            img = (cv2.cvtColor(img, cv2.COLOR_BGR2RGB) / 255.0) * 2.0 - 1.0
             return torch.tensor(img).permute(2, 0, 1).float()  # To float (FP32); autocast handles FP16
 
         for i in range(HISTORY_LEN):
