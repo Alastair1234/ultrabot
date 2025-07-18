@@ -13,9 +13,16 @@ from tqdm import tqdm
 from scipy.spatial.transform import Rotation as R
 from matplotlib.backends.backend_pdf import PdfPages
 
-from torch.cuda.amp import GradScaler, autocast
+import warnings  # Added to suppress FutureWarnings
+from torch.amp import GradScaler, autocast  # Updated import for PyTorch 2.5+ (replaces torch.cuda.amp)
 
 from model_csgo_adapted import UltrasoundDenoiser
+
+# Suppress FutureWarnings (e.g., for deprecated features)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Enable CuDNN benchmarking for better performance on GPU
+torch.backends.cudnn.benchmark = True
 
 HISTORY_LEN = 4  
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -103,7 +110,7 @@ def train_epoch(model, loader, criterion, optimizer, scaler):
         c_skip, c_out, c_in = get_karras_conditioners(sigmas)
         c_skip, c_out, c_in = [c.view(-1, 1, 1, 1) for c in (c_skip, c_out, c_in)]
 
-        with autocast(dtype=torch.float16):
+        with autocast(device_type='cuda', dtype=torch.float16):  # Updated for PyTorch 2.5+
             model_output = model(context_imgs, context_deltas, noisy_target_img * c_in, sigmas)
             target_for_loss = (target_img - c_skip * noisy_target_img) / c_out
             loss = criterion(model_output, target_for_loss)
@@ -221,10 +228,10 @@ def main(args):
     model = UltrasoundDenoiser(
         history_len=HISTORY_LEN,
         pose_dim=7,
-        cond_channels=1024,
-        channels=[64, 128, 256, 512],
-        depths=[1, 1, 2, 2],
-        attn_depths=[False, False, True, False]
+        cond_channels=2048,  # Large/full size (uncommented for H200)
+        channels=[128, 256, 512, 1024],  # Large/full size (uncommented for H200)
+        depths=[2, 2, 2, 2],  # Large/full size (uncommented for H200)
+        attn_depths=[False, False, True, True]  # Large/full size (uncommented for H200)
     ).to(DEVICE)
     
     print(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
@@ -233,7 +240,7 @@ def main(args):
     criterion = nn.MSELoss()
     
     if DEVICE.type == 'cuda':
-        scaler = GradScaler('cuda')  # Updated to new API (suppresses FutureWarning)
+        scaler = GradScaler(device='cuda')  # Updated for PyTorch 2.5+
     else:
         scaler = GradScaler()  # Fallback for non-CUDA (though AMP won't be used)
         print("Warning: Running on CPU - mixed precision (AMP) is disabled.")
