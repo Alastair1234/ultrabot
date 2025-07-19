@@ -5,7 +5,7 @@ from transformers import AutoModel, AutoImageProcessor
 class DinoV2PairTransformer(nn.Module):
     def __init__(self, 
                  output_dim=7, 
-                 vision_model='facebook/webssl-dino2b-full2b-224',
+                 vision_model='facebook/webssl-dino7b-full8b-224',
                  hidden_dim=768, 
                  nhead=8, 
                  num_layers=2,
