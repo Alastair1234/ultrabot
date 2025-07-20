@@ -250,8 +250,15 @@ def eval_and_plot(model, loader, epoch, run_timestamp, train_loss, peak_mem):  #
 # =================================================================================
 
 def main(args):
-    train_patient_dirs = [os.path.join(args.data_root, 'train', d) for d in os.listdir(os.path.join(args.data_root, 'train'))]
-    val_patient_dirs = [os.path.join(args.data_root, 'val', d) for d in os.listdir(os.path.join(args.data_root, 'val'))]
+    # NEW: Handle single patient mode
+    if args.single_patient:
+        print(f"Single patient mode enabled: Using {args.single_patient} for both train and val.")
+        train_patient_dirs = [args.single_patient]
+        val_patient_dirs = [args.single_patient]  # Eval on same patient
+        args.val_sequences = 50  # Reduce val sequences to avoid too much overlap/heavy eval; adjust as needed
+    else:
+        train_patient_dirs = [os.path.join(args.data_root, 'train', d) for d in os.listdir(os.path.join(args.data_root, 'train'))]
+        val_patient_dirs = [os.path.join(args.data_root, 'val', d) for d in os.listdir(os.path.join(args.data_root, 'val'))]
     
     run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     checkpoint_dir = './checkpoints'
@@ -316,6 +323,8 @@ if __name__ == '__main__':
     parser.add_argument('--sequences_per_patient', default=1000, type=int, help="How many sequences to sample from each patient for training")
     parser.add_argument('--val_sequences', default=100, type=int, help="How many sequences to sample from each patient for validation")
     parser.add_argument('--checkpoint_freq', default=5, type=int, help="Frequency of saving checkpoints and plotting validation results")
+    # NEW: Argument for single patient mode
+    parser.add_argument('--single_patient', default=None, help="Path to single patient directory (e.g., './ct_data_random_angle/train/patient_001'). If provided, train and val use only this directory.")
     args = parser.parse_args()
     
     main(args)
