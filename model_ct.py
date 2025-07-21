@@ -5,14 +5,19 @@ from transformers import AutoModel, AutoImageProcessor
 class DinoV2PairTransformer(nn.Module):
     def __init__(self, 
                  output_dim=7, 
-                 vision_model='facebook/webssl-dino2b-full2b-224',
+                 vision_model='facebook/webssl-dino300m-full2b-224',  # Your requested model
                  hidden_dim=768, 
                  nhead=8, 
                  num_layers=2,
-                 delta_input_dim=7):
+                 delta_input_dim=7,
+                 img_size=224):  # Added img_size param (default 224, set to 56 for downsizing)
         super().__init__()
 
-        self.processor = AutoImageProcessor.from_pretrained(vision_model, do_rescale=False, use_fast=True)
+        self.processor = AutoImageProcessor.from_pretrained(
+            vision_model, 
+            do_rescale=False, 
+            size={'height': img_size, 'width': img_size}  # Use provided img_size
+        )
         self.encoder = AutoModel.from_pretrained(vision_model)
         encoder_dim = self.encoder.config.hidden_size
 
@@ -48,6 +53,12 @@ class DinoV2PairTransformer(nn.Module):
 
         projected_embed = self.projector(combined_embed).unsqueeze(1)
 
-        transformer_out = self.transformer_encoder(projected_embed).squeeze(1)
+        # Enable Flash Attention for the transformer (memory-efficient)
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=True,    # Flash Attention
+            enable_math=False,    # Disable fallback
+            enable_mem_efficient=False  # Prioritize flash over mem-efficient
+        ):
+            transformer_out = self.transformer_encoder(projected_embed).squeeze(1)
 
         return self.regressor(transformer_out)
