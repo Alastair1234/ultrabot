@@ -17,9 +17,8 @@ import argparse
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class CTDataset(Dataset):
-    def __init__(self, patient_dirs, pairs_per_patient=500, img_size=56):  # Added img_size param (56 for 14*4)
+    def __init__(self, patient_dirs, pairs_per_patient=500):
         self.data_triplets = []
-        self.img_size = img_size
         for patient_dir in tqdm(patient_dirs, desc="Loading patient data"):
             info_path = os.path.join(patient_dir, 'info.json')
             images_dir = os.path.join(patient_dir, 'images')
@@ -70,7 +69,7 @@ class CTDataset(Dataset):
 
         def load_img(pt):
             img = cv2.cvtColor(cv2.imread(os.path.join(images_dir, pt['FileName'])), cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (self.img_size, self.img_size)) / 255.0  # Resize to smaller size
+            img = cv2.resize(img, (224, 224)) / 255.0  # Resize to 224x224 (if not already)
             return torch.tensor(img).permute(2, 0, 1).float()
 
         img1 = load_img(p1)
@@ -158,6 +157,12 @@ def eval_epoch(model, loader, criterion):
     return total_loss / len(loader), np.vstack(preds), np.vstack(labels_list)
 
 def main(args):
+    # Enable Flash Attention globally (for broader application, including in DinoV2 encoder if compatible)
+    torch.backends.cuda.enable_flash_sdp(True)
+
+    # Suppress Torch Dynamo errors (fallback to eager if compile fails)
+    torch._dynamo.config.suppress_errors = True
+
     train_dirs = [os.path.join(args.data_root, 'train', d) for d in os.listdir(os.path.join(args.data_root, 'train'))]
     val_dirs = [os.path.join(args.data_root, 'val', d) for d in os.listdir(os.path.join(args.data_root, 'val'))]
 
@@ -166,21 +171,20 @@ def main(args):
         val_dirs = [val_dirs[0]]
         print(f"Single patient mode: train={train_dirs[0]}, val={val_dirs[0]}")
 
-    train_dataset = CTDataset(train_dirs, args.pairs_per_patient, img_size=56)
-    val_dataset = CTDataset(val_dirs, args.val_pairs, img_size=56)
+    train_dataset = CTDataset(train_dirs, args.pairs_per_patient)
+    val_dataset = CTDataset(val_dirs, args.val_pairs)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     model = DinoV2PairTransformer(
-        vision_model='facebook/webssl-dino300m-full2b-224',  # Your requested model
-        img_size=56  # Match dataset downsizing
+        vision_model='facebook/webssl-dino300m-full2b-224'  # Your requested model
     ).to(device)
     
-    # Optional: Enable gradient checkpointing if OOM persists with larger model
-    # model.encoder.gradient_checkpointing = True
+    # Enable gradient checkpointing to mitigate OOM with larger inputs/model
+    model.encoder.gradient_checkpointing = True
     
-    model = torch.compile(model)  # Optional: Compile for extra optimizations (PyTorch 2+)
+    model = torch.compile(model)  # Optional; comment out if issues persist
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
@@ -202,7 +206,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', default='./ct_data_random_angle')
     parser.add_argument('--epochs', default=20, type=int)
-    parser.add_argument('--batch_size', default=32, type=int)  # Reduce to 16 or 8 if OOM persists
+    parser.add_argument('--batch_size', default=32, type=int)  # Reduce to 8-16 if OOM with 224x224
     parser.add_argument('--lr', default=1e-5, type=float)
     parser.add_argument('--pairs_per_patient', default=2000, type=int)
     parser.add_argument('--val_pairs', default=500, type=int)

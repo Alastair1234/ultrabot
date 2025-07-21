@@ -9,14 +9,14 @@ class DinoV2PairTransformer(nn.Module):
                  hidden_dim=768, 
                  nhead=8, 
                  num_layers=2,
-                 delta_input_dim=7,
-                 img_size=224):  # Added img_size param (default 224, set to 56 for downsizing)
+                 delta_input_dim=7):
         super().__init__()
 
         self.processor = AutoImageProcessor.from_pretrained(
             vision_model, 
             do_rescale=False, 
-            size={'height': img_size, 'width': img_size}  # Use provided img_size
+            use_fast=True,  # Re-added to use fast processor
+            size={'height': 224, 'width': 224}  # Explicitly set to 224x224
         )
         self.encoder = AutoModel.from_pretrained(vision_model)
         encoder_dim = self.encoder.config.hidden_size
