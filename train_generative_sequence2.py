@@ -29,15 +29,17 @@ torch.backends.cuda.matmul.allow_tf32 = True
 HISTORY_LEN = 4  
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SIGMA_DATA = 0.5 
-IMAGE_SIZE = (256, 256)  # Keep for quality
+LOW_RES_SIZE = (64, 64)  # Low-res for world model (physics prediction)
 
 class CTSequenceDataset(Dataset):
     """
     Loads sequences of ultrasound images and their corresponding poses.
+    Focuses on low-res only for world model training.
     """
-    def __init__(self, patient_dirs, sequences_per_patient=500, is_val=False):
+    def __init__(self, patient_dirs, sequences_per_patient=500, is_val=False, single_patient=False):
         self.sequences = []
         self.is_val = is_val
+        self.single_patient = single_patient  # New: For deterministic splitting
         
         for patient_dir in tqdm(patient_dirs, desc=f"Loading {'Val' if is_val else 'Train'} Patient Data"):
             info_path = os.path.join(patient_dir, 'info.json')
@@ -50,11 +52,29 @@ class CTSequenceDataset(Dataset):
             if len(points) < HISTORY_LEN + 1:
                 continue
 
-            for _ in range(sequences_per_patient):
-                start_idx = random.randint(0, len(points) - (HISTORY_LEN + 1))
+            if self.single_patient:
+                # Deterministic split for single patient to avoid train/val overlap
+                split_ratio = 0.8  # 80% train, 20% val
+                split_point = int(len(points) * split_ratio)
+                if is_val:
+                    available_start_indices = range(split_point, len(points) - HISTORY_LEN)
+                else:
+                    available_start_indices = range(0, split_point - HISTORY_LEN)
+                
+                if len(available_start_indices) < 1:
+                    print(f"Warning: Not enough points for {'val' if is_val else 'train'} split in {patient_dir}. Skipping.")
+                    continue
+                
+                # Sample sequences without replacement to minimize any micro-overlap risk
+                num_sequences = min(sequences_per_patient, len(available_start_indices))
+                selected_indices = random.sample(list(available_start_indices), num_sequences)
+            else:
+                # Original random sampling for multi-patient
+                selected_indices = [random.randint(0, len(points) - (HISTORY_LEN + 1)) for _ in range(sequences_per_patient)]
+
+            for start_idx in selected_indices:
                 end_idx = start_idx + HISTORY_LEN + 1
                 sequence_points = points[start_idx:end_idx]
-                
                 self.sequences.append((images_dir, sequence_points))
 
     def _calc_delta_pose(self, p1, p2):
@@ -73,23 +93,23 @@ class CTSequenceDataset(Dataset):
 
     def __getitem__(self, idx):
         images_dir, sequence_points = self.sequences[idx]
-        context_imgs, context_deltas = [], []
+        context_imgs_low, context_deltas = [], []
 
         def load_img(pt):
             path = os.path.join(images_dir, pt['FileName'])
             img = cv2.imread(path)
-            img = cv2.resize(img, IMAGE_SIZE)  # Resize for memory savings
-            img = (cv2.cvtColor(img, cv2.COLOR_BGR2RGB) / 255.0) * 2.0 - 1.0
-            return torch.tensor(img).permute(2, 0, 1).float()  # To float (FP32); autocast handles FP16
+            low_img = cv2.resize(img, LOW_RES_SIZE, interpolation=cv2.INTER_AREA)  # Low-res only
+            low_img = (cv2.cvtColor(low_img, cv2.COLOR_BGR2RGB) / 255.0) * 2.0 - 1.0
+            return torch.tensor(low_img).permute(2, 0, 1).float()  # To float (FP32); autocast handles FP16
 
         for i in range(HISTORY_LEN):
-            img = load_img(sequence_points[i])
+            low_img = load_img(sequence_points[i])
             delta = self._calc_delta_pose(sequence_points[i], sequence_points[i+1])
-            context_imgs.append(img)
+            context_imgs_low.append(low_img)
             context_deltas.append(torch.tensor(delta, dtype=torch.float))  # To float (FP32)
 
-        target_img = load_img(sequence_points[HISTORY_LEN])
-        return torch.stack(context_imgs), torch.stack(context_deltas), target_img
+        target_low = load_img(sequence_points[HISTORY_LEN])
+        return torch.stack(context_imgs_low), torch.stack(context_deltas), target_low
 
 def get_karras_conditioners(sigmas):
     c_skip = SIGMA_DATA**2 / (sigmas**2 + SIGMA_DATA**2)
@@ -97,25 +117,25 @@ def get_karras_conditioners(sigmas):
     c_in = 1 / (sigmas**2 + SIGMA_DATA**2).sqrt()
     return c_skip, c_out, c_in
 
-def train_epoch(model, loader, criterion, optimizer, scaler, accum_steps=8):  # Bumped to 8 for efficiency
+def train_epoch(model, loader, criterion, optimizer, scaler, accum_steps=8):
     model.train()
     total_loss = 0
-    for batch_idx, (context_imgs, context_deltas, target_img) in enumerate(tqdm(loader, desc='Training', leave=False)):
-        context_imgs, context_deltas, target_img = (
-            context_imgs.to(DEVICE), context_deltas.to(DEVICE), target_img.to(DEVICE)
+    for batch_idx, (context_imgs_low, context_deltas, target_low) in enumerate(tqdm(loader, desc='Training', leave=False)):
+        context_imgs_low, context_deltas, target_low = (
+            context_imgs_low.to(DEVICE), context_deltas.to(DEVICE), target_low.to(DEVICE)
         )
         optimizer.zero_grad()  # Zero at start of accum cycle
         
-        sigmas = (torch.randn(target_img.shape[0], device=DEVICE) * 1.2 - 1.2).exp() 
-        noise = torch.randn_like(target_img)
-        noisy_target_img = target_img + noise * sigmas.view(-1, 1, 1, 1)
+        sigmas = (torch.randn(target_low.shape[0], device=DEVICE) * 1.2 - 1.2).exp() 
+        noise = torch.randn_like(target_low)
+        noisy_target_low = target_low + noise * sigmas.view(-1, 1, 1, 1)
 
         c_skip, c_out, c_in = get_karras_conditioners(sigmas)
         c_skip, c_out, c_in = [c.view(-1, 1, 1, 1) for c in (c_skip, c_out, c_in)]
 
         with autocast(device_type='cuda', dtype=torch.float16):  # Updated
-            model_output = model(context_imgs, context_deltas, noisy_target_img * c_in, sigmas)
-            target_for_loss = (target_img - c_skip * noisy_target_img) / c_out
+            model_output = model(context_imgs_low, context_deltas, noisy_target_low * c_in, sigmas)
+            target_for_loss = (target_low - c_skip * noisy_target_low) / c_out
             loss = criterion(model_output, target_for_loss) / accum_steps  # Normalize loss for accum
             
         scaler.scale(loss).backward()
@@ -154,11 +174,11 @@ def get_gpu_stats():
         return {'Error': str(e)}
 
 @torch.no_grad()
-def sample_k_diffusion(model, context_imgs, context_deltas, num_steps=20, sigma_max=20.0, sigma_min=0.002, rho=7.0, sub_batch_size=1):
+def sample_k_diffusion(model, context_imgs_low, context_deltas, num_steps=20, sigma_max=20.0, sigma_min=0.002, rho=7.0, sub_batch_size=1):
     model.eval()
     generated = []
-    for i in range(0, context_imgs.shape[0], sub_batch_size):  # Process in sub-batches
-        sub_imgs = context_imgs[i:i+sub_batch_size]
+    for i in range(0, context_imgs_low.shape[0], sub_batch_size):  # Process in sub-batches
+        sub_imgs = context_imgs_low[i:i+sub_batch_size]
         sub_deltas = context_deltas[i:i+sub_batch_size]
         B, _, C, H, W = sub_imgs.shape
         
@@ -196,31 +216,31 @@ def eval_and_plot(model, loader, epoch, run_timestamp, train_loss, peak_mem):  #
     pdf_path = os.path.join(pdf_dir, f'generated_epoch_{epoch}_{run_timestamp}.pdf')
     
     try:
-        context_imgs, context_deltas, target_img = next(iter(loader))
+        context_imgs_low, context_deltas, target_low = next(iter(loader))
     except StopIteration:
         print("Validation loader is empty. Cannot plot results.")
         return
 
-    context_imgs, context_deltas = context_imgs.to(DEVICE), context_deltas.to(DEVICE)
+    context_imgs_low, context_deltas = context_imgs_low.to(DEVICE), context_deltas.to(DEVICE)
     
-    generated_img = sample_k_diffusion(model, context_imgs, context_deltas, sub_batch_size=1)  # Low sub-batch for memory
+    generated_low = sample_k_diffusion(model, context_imgs_low, context_deltas, sub_batch_size=1)  # Low sub-batch for memory
 
     with PdfPages(pdf_path) as pdf:
-        for i in range(min(context_imgs.shape[0], 5)):
+        for i in range(min(context_imgs_low.shape[0], 5)):
             fig, axes = plt.subplots(1, HISTORY_LEN + 2, figsize=(20, 4))
-            fig.suptitle(f"Epoch {epoch} - Example {i+1}")
+            fig.suptitle(f"Epoch {epoch} - Example {i+1} (Low-Res World Model)")
             
             for j in range(HISTORY_LEN):
-                axes[j].imshow(denormalize_img(context_imgs[i, j]))
-                axes[j].set_title(f"Context {j+1}")
+                axes[j].imshow(denormalize_img(context_imgs_low[i, j]))
+                axes[j].set_title(f"Context {j+1} (Low-Res)")
                 axes[j].axis('off')
             
-            axes[HISTORY_LEN].imshow(denormalize_img(target_img[i]))
-            axes[HISTORY_LEN].set_title("Ground Truth")
+            axes[HISTORY_LEN].imshow(denormalize_img(target_low[i]))
+            axes[HISTORY_LEN].set_title("Ground Truth (Low-Res)")
             axes[HISTORY_LEN].axis('off')
 
-            axes[HISTORY_LEN + 1].imshow(denormalize_img(generated_img[i]))
-            axes[HISTORY_LEN + 1].set_title("Generated")
+            axes[HISTORY_LEN + 1].imshow(denormalize_img(generated_low[i]))
+            axes[HISTORY_LEN + 1].set_title("Generated (Low-Res)")
             axes[HISTORY_LEN + 1].axis('off')
             
             pdf.savefig(fig)
@@ -250,15 +270,28 @@ def eval_and_plot(model, loader, epoch, run_timestamp, train_loss, peak_mem):  #
 # =================================================================================
 
 def main(args):
-    # NEW: Handle single patient mode
-    if args.single_patient:
-        print(f"Single patient mode enabled: Using {args.single_patient} for both train and val.")
-        train_patient_dirs = [args.single_patient]
-        val_patient_dirs = [args.single_patient]  # Eval on same patient
+    # Handle single patient mode
+    if args.use_single_patient or args.single_patient is not None:
+        if args.single_patient is None:
+            # Auto-select the first available patient from train dir
+            train_dir = os.path.join(args.data_root, 'train')
+            if not os.path.exists(train_dir):
+                raise ValueError(f"Train directory not found: {train_dir}")
+            patient_dirs = sorted([d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))])
+            if not patient_dirs:
+                raise ValueError(f"No patient directories found in {train_dir}")
+            selected_patient = os.path.join(train_dir, patient_dirs[0])
+            print(f"Single patient mode enabled (auto-selected): Using {selected_patient} for both train and val.")
+        else:
+            selected_patient = args.single_patient
+            print(f"Single patient mode enabled: Using {selected_patient} for both train and val.")
+        
+        train_patient_dirs = [selected_patient]
+        val_patient_dirs = [selected_patient]  # Eval on same patient
         args.val_sequences = 50  # Reduce val sequences to avoid too much overlap/heavy eval; adjust as needed
     else:
-        train_patient_dirs = [os.path.join(args.data_root, 'train', d) for d in os.listdir(os.path.join(args.data_root, 'train'))]
-        val_patient_dirs = [os.path.join(args.data_root, 'val', d) for d in os.listdir(os.path.join(args.data_root, 'val'))]
+        train_patient_dirs = [os.path.join(args.data_root, 'train', d) for d in os.listdir(os.path.join(args.data_root, 'train')) if os.path.isdir(os.path.join(args.data_root, 'train', d))]
+        val_patient_dirs = [os.path.join(args.data_root, 'val', d) for d in os.listdir(os.path.join(args.data_root, 'val')) if os.path.isdir(os.path.join(args.data_root, 'val', d))]
     
     run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     checkpoint_dir = './checkpoints'
@@ -268,8 +301,8 @@ def main(args):
     print(f"PDFs will be saved to: ./pdf_outputs/")
     print(f"Checkpoints will be saved to: {checkpoint_dir}/")
 
-    train_dataset = CTSequenceDataset(train_patient_dirs, args.sequences_per_patient)
-    val_dataset = CTSequenceDataset(val_patient_dirs, args.val_sequences, is_val=True)
+    train_dataset = CTSequenceDataset(train_patient_dirs, args.sequences_per_patient, single_patient=(args.use_single_patient or args.single_patient is not None))
+    val_dataset = CTSequenceDataset(val_patient_dirs, args.val_sequences, is_val=True, single_patient=(args.use_single_patient or args.single_patient is not None))
     
     if len(train_dataset) == 0:
         print("Error: Training dataset is empty. Check data paths.")
@@ -280,13 +313,14 @@ def main(args):
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=False, persistent_workers=False)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, drop_last=False, persistent_workers=False)
 
+    # World model only (low-res physics predictor)
     model = UltrasoundDenoiser(
         history_len=HISTORY_LEN,
         pose_dim=7,
-        cond_channels=4096,  # Large config for high quality
-        channels=[320, 640, 1280, 1280],
-        depths=[3, 4, 4, 3],
-        attn_depths=[False, False, True, True]
+        cond_channels=2048,  # Balanced for richness without excess VRAM
+        channels=[256, 512, 1024, 1024],  # Powerful for dynamics; scale down if OOM (e.g., [128, 256, 512, 512])
+        depths=[2, 3, 3, 2],  # Deeper in middle for feature extraction
+        attn_depths=[False, True, True, True]  # Attention where it matters (deeper layers)
     ).to(DEVICE)  # No .half() - keep FP32 params; autocast handles FP16 compute
     
     print(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
@@ -323,8 +357,8 @@ if __name__ == '__main__':
     parser.add_argument('--sequences_per_patient', default=1000, type=int, help="How many sequences to sample from each patient for training")
     parser.add_argument('--val_sequences', default=100, type=int, help="How many sequences to sample from each patient for validation")
     parser.add_argument('--checkpoint_freq', default=5, type=int, help="Frequency of saving checkpoints and plotting validation results")
-    # NEW: Argument for single patient mode
     parser.add_argument('--single_patient', default=None, help="Path to single patient directory (e.g., './ct_data_random_angle/train/patient_001'). If provided, train and val use only this directory.")
+    parser.add_argument('--use_single_patient', action='store_true', help="Enable single patient mode. If --single_patient is not specified, automatically picks the first available patient from data_root/train.")
     args = parser.parse_args()
     
     main(args)
