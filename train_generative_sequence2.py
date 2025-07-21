@@ -13,11 +13,10 @@ from tqdm import tqdm
 from scipy.spatial.transform import Rotation as R
 from matplotlib.backends.backend_pdf import PdfPages
 import subprocess  # For querying nvidia-smi
+import sklearn.neighbors as sknn  # For KNN sampling
 
 import warnings  # For suppressing warnings
 from torch.amp import GradScaler, autocast  # Updated for PyTorch 2.5+
-
-from model_csgo_adapted import UltrasoundDenoiser
 
 # Suppress FutureWarnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -35,11 +34,13 @@ class CTSequenceDataset(Dataset):
     """
     Loads sequences of ultrasound images and their corresponding poses.
     Focuses on low-res only for world model training.
+    Updated: Uses KNN-based sampling for pseudo-contiguous sequences based on pose similarity (for random/unordered poses).
     """
-    def __init__(self, patient_dirs, sequences_per_patient=500, is_val=False, single_patient=False):
+    def __init__(self, patient_dirs, sequences_per_patient=500, is_val=False, single_patient=False, use_knn=True):
         self.sequences = []
         self.is_val = is_val
-        self.single_patient = single_patient  # New: For deterministic splitting
+        self.single_patient = single_patient
+        self.use_knn = use_knn  # Flag: True for KNN (random poses), False for contiguous (sequential data)
         
         for patient_dir in tqdm(patient_dirs, desc=f"Loading {'Val' if is_val else 'Train'} Patient Data"):
             info_path = os.path.join(patient_dir, 'info.json')
@@ -52,29 +53,64 @@ class CTSequenceDataset(Dataset):
             if len(points) < HISTORY_LEN + 1:
                 continue
 
+            # Handle splitting and indices
             if self.single_patient:
-                # Deterministic split for single patient to avoid train/val overlap
-                split_ratio = 0.8  # 80% train, 20% val
+                # Deterministic split for single patient to avoid leakage
+                split_ratio = 0.8
                 split_point = int(len(points) * split_ratio)
                 if is_val:
-                    available_start_indices = range(split_point, len(points) - HISTORY_LEN)
+                    available_indices = list(range(split_point, len(points)))
                 else:
-                    available_start_indices = range(0, split_point - HISTORY_LEN)
-                
-                if len(available_start_indices) < 1:
+                    available_indices = list(range(0, split_point))
+                num_sequences = min(sequences_per_patient, len(available_indices))
+                if num_sequences < 1:
                     print(f"Warning: Not enough points for {'val' if is_val else 'train'} split in {patient_dir}. Skipping.")
                     continue
-                
-                # Sample sequences without replacement to minimize any micro-overlap risk
-                num_sequences = min(sequences_per_patient, len(available_start_indices))
-                selected_indices = random.sample(list(available_start_indices), num_sequences)
+                selected_start_indices = random.sample(available_indices, num_sequences)
+                # For KNN: Extract points and poses for this split only (prevents leakage)
+                split_points = [points[idx] for idx in available_indices]
+                split_poses = np.array([[
+                    p['Position']['x'], p['Position']['y'], p['Position']['z'],
+                    p['RotationQuaternion']['x'], p['RotationQuaternion']['y'], p['RotationQuaternion']['z'], p['RotationQuaternion']['w']
+                ] for p in split_points])
+                # Map back to original indices for sequence building
+                split_to_original = {i: available_indices[i] for i in range(len(available_indices))}
             else:
-                # Original random sampling for multi-patient
-                selected_indices = [random.randint(0, len(points) - (HISTORY_LEN + 1)) for _ in range(sequences_per_patient)]
+                num_sequences = sequences_per_patient
+                selected_start_indices = random.sample(range(len(points)), num_sequences)
+                split_points = points  # Use all
+                split_poses = np.array([[
+                    p['Position']['x'], p['Position']['y'], p['Position']['z'],
+                    p['RotationQuaternion']['x'], p['RotationQuaternion']['y'], p['RotationQuaternion']['z'], p['RotationQuaternion']['w']
+                ] for p in split_points])
+                split_to_original = {i: i for i in range(len(split_points))}
 
-            for start_idx in selected_indices:
-                end_idx = start_idx + HISTORY_LEN + 1
-                sequence_points = points[start_idx:end_idx]
+            # Build KNN model if enabled (fit on split_poses to avoid leakage)
+            if self.use_knn:
+                if len(split_poses) < HISTORY_LEN + 1:
+                    continue
+                knn = sknn.NearestNeighbors(n_neighbors=HISTORY_LEN + 2, metric='euclidean')  # +2 for safety (skip self)
+                knn.fit(split_poses)
+
+            for start_idx in selected_start_indices:
+                if self.use_knn:
+                    # Find nearest neighbors in the split
+                    split_start_idx = available_indices.index(start_idx) if self.single_patient else start_idx
+                    distances, indices = knn.kneighbors([split_poses[split_start_idx]], n_neighbors=HISTORY_LEN + 2)
+                    # Build sequence indices (skip self if it's first)
+                    seq_split_indices = indices[0][1:HISTORY_LEN + 2]  # Skip self, take next
+                    if len(seq_split_indices) < HISTORY_LEN + 1:
+                        continue
+                    # Map back to original points indices
+                    seq_original_indices = [split_to_original[int(idx)] for idx in seq_split_indices[:HISTORY_LEN + 1]]
+                    sequence_points = [points[idx] for idx in seq_original_indices]
+                else:
+                    # Fallback: Contiguous sampling (assuming ordered data)
+                    end_idx = start_idx + HISTORY_LEN + 1
+                    if end_idx > len(points):
+                        continue
+                    sequence_points = points[start_idx:end_idx]
+                
                 self.sequences.append((images_dir, sequence_points))
 
     def _calc_delta_pose(self, p1, p2):
@@ -216,7 +252,18 @@ def eval_and_plot(model, loader, epoch, run_timestamp, train_loss, peak_mem):  #
     pdf_path = os.path.join(pdf_dir, f'generated_epoch_{epoch}_{run_timestamp}.pdf')
     
     try:
+        # Get a batch and also compute deltas for visualization
         context_imgs_low, context_deltas, target_low = next(iter(loader))
+        # Compute human-readable delta strings for PDF overlays
+        delta_strings = []
+        for i in range(context_imgs_low.shape[0]):  # Per batch item
+            seq_deltas = []
+            for j in range(HISTORY_LEN):
+                delta = context_deltas[i, j].cpu().numpy()  # [pos_diff (3), quat_diff (4)]
+                pos_str = f"ΔPos: {delta[0:3].round(2)}"
+                quat_str = f"ΔQuat: {delta[3:7].round(2)}"
+                seq_deltas.append(f"{pos_str}\n{quat_str}")
+            delta_strings.append(seq_deltas)
     except StopIteration:
         print("Validation loader is empty. Cannot plot results.")
         return
@@ -231,15 +278,20 @@ def eval_and_plot(model, loader, epoch, run_timestamp, train_loss, peak_mem):  #
             fig.suptitle(f"Epoch {epoch} - Example {i+1} (Low-Res World Model)")
             
             for j in range(HISTORY_LEN):
-                axes[j].imshow(denormalize_img(context_imgs_low[i, j]))
+                axes[j].imshow(denormalize_img(context_imgs_low[i, j].cpu()))  # Move to CPU for plotting
                 axes[j].set_title(f"Context {j+1} (Low-Res)")
                 axes[j].axis('off')
-            
-            axes[HISTORY_LEN].imshow(denormalize_img(target_low[i]))
+                
+                # Add transition (delta) text "between" frames (overlay on right side of each context frame)
+                if j < HISTORY_LEN:
+                    axes[j].text(1.05, 0.5, delta_strings[i][j], transform=axes[j].transAxes, 
+                                 fontsize=8, va='center', ha='left', bbox=dict(facecolor='white', alpha=0.5))
+
+            axes[HISTORY_LEN].imshow(denormalize_img(target_low[i].cpu()))
             axes[HISTORY_LEN].set_title("Ground Truth (Low-Res)")
             axes[HISTORY_LEN].axis('off')
 
-            axes[HISTORY_LEN + 1].imshow(denormalize_img(generated_low[i]))
+            axes[HISTORY_LEN + 1].imshow(denormalize_img(generated_low[i].cpu()))
             axes[HISTORY_LEN + 1].set_title("Generated (Low-Res)")
             axes[HISTORY_LEN + 1].axis('off')
             
@@ -264,6 +316,208 @@ def eval_and_plot(model, loader, epoch, run_timestamp, train_loss, peak_mem):  #
         plt.close(fig_stats)
     
     torch.cuda.empty_cache()  # Clear after eval
+
+# =================================================================================
+#  --- Model Definition (Inlined from model_csgo_adapted.py) ---
+# =================================================================================
+
+import torch
+from torch import Tensor
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import List, Optional
+from flash_attn import flash_attn_func  # Correct import for efficient, exact attention (fixes OOM)
+# NOTE: Ensure flash-attn is installed: pip install flash-attn
+
+# =================================================================================
+#  --- Building Blocks (Unchanged and Correct) ---
+# =================================================================================
+
+class GroupNorm(nn.Module):
+    def __init__(self, in_channels: int):
+        super().__init__()
+        num_groups = max(1, in_channels // 32)
+        self.norm = nn.GroupNorm(num_groups, in_channels, eps=1e-5)
+    def forward(self, x: Tensor) -> Tensor: return self.norm(x)
+
+class AdaGroupNorm(nn.Module):
+    def __init__(self, in_channels: int, cond_channels: int):
+        super().__init__()
+        self.in_channels, self.num_groups = in_channels, max(1, in_channels // 32)
+        self.linear = nn.Linear(cond_channels, in_channels * 2)
+    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+        x_norm = F.group_norm(x, self.num_groups, eps=1e-5)
+        scale, shift = self.linear(cond)[:, :, None, None].chunk(2, dim=1)
+        return x_norm * (1 + scale) + shift
+
+class SelfAttention2d(nn.Module):
+    def __init__(self, in_channels: int, head_dim: int = 8):
+        super().__init__()
+        self.n_head = max(1, in_channels // head_dim)
+        assert in_channels % self.n_head == 0
+        self.norm = GroupNorm(in_channels)
+        self.qkv_proj = nn.Conv2d(in_channels, in_channels * 3, 1)
+        self.out_proj = nn.Conv2d(in_channels, in_channels, 1)
+        nn.init.zeros_(self.out_proj.weight), nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        n, c, h, w = x.shape
+        x_norm = self.norm(x)
+        qkv = self.qkv_proj(x_norm).view(n, self.n_head * 3, c // self.n_head, h * w).transpose(2, 3)
+        q, k, v = qkv.chunk(3, dim=1)  # Each: (B, n_head, H*W, head_dim)
+
+        # Reshape for Flash Attention: (B, H*W, n_head, head_dim) and ensure contiguous for backward pass
+        q = q.permute(0, 2, 1, 3).contiguous()  # (B, H*W, n_head, head_dim)
+        k = k.permute(0, 2, 1, 3).contiguous()
+        v = v.permute(0, 2, 1, 3).contiguous()
+
+        # Flash Attention (exact replacement: computes softmax(qk) @ v efficiently, no OOM)
+        y = flash_attn_func(
+            q, k, v,
+            softmax_scale=1 / math.sqrt(k.size(-1)),  # Same scale as original
+            causal=False  # No causal mask (assuming self-attn over flattened image; set True if needed)
+        )
+
+        # Reshape back to original format
+        y = y.permute(0, 2, 1, 3).reshape(n, c, h, w)  # (B, n_head, H*W, head_dim) -> (B, C, H, W)
+        return x + self.out_proj(y)
+
+class FourierFeatures(nn.Module):
+    def __init__(self, cond_channels: int):
+        super().__init__(); assert cond_channels % 2 == 0
+        self.register_buffer("weight", torch.randn(1, cond_channels // 2))
+    def forward(self, input: Tensor) -> Tensor:
+        f = 2 * math.pi * input.unsqueeze(1) @ self.weight
+        return torch.cat([f.cos(), f.sin()], dim=-1)
+
+class ResBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, cond_channels: int, attn: bool):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        self.norm1, self.conv1 = AdaGroupNorm(in_channels, cond_channels), nn.Conv2d(in_channels, out_channels, 3, 1, 1)
+        self.norm2, self.conv2 = AdaGroupNorm(out_channels, cond_channels), nn.Conv2d(out_channels, out_channels, 3, 1, 1)
+        self.attn = SelfAttention2d(out_channels) if attn else nn.Identity()
+        nn.init.zeros_(self.conv2.weight)
+    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+        r = self.proj(x)
+        x = self.conv1(F.silu(self.norm1(x, cond)))
+        x = self.conv2(F.silu(self.norm2(x, cond)))
+        return self.attn(x + r)
+
+class UNet(nn.Module):
+    def __init__(self, cond_channels: int, depths: List[int], channels: List[int], attn_depths: List[int]):
+        super().__init__()
+        self.d_blocks, self.u_blocks = nn.ModuleList(), nn.ModuleList()
+        self.downsamples, self.upsamples = nn.ModuleList(), nn.ModuleList()
+        
+        # -- ENCODER INITIALIZATION --
+        for i, (d, c, a) in enumerate(zip(depths, channels, attn_depths)):
+            in_c = channels[i-1] if i > 0 else c
+            self.downsamples.append(nn.Conv2d(in_c, c, 3, 2, 1) if i > 0 else nn.Identity())
+            self.d_blocks.append(nn.ModuleList([ResBlock(c, c, cond_channels, a) for _ in range(d)]))
+
+        # -- BOTTLENECK --
+        self.mid_block = ResBlock(channels[-1], channels[-1], cond_channels, attn=True)
+        reversed_params = list(reversed(list(zip(depths, channels, attn_depths))))[:-1]
+        for i, (d, c, a) in enumerate(reversed_params):
+            in_c = channels[len(channels) - 1 - i]
+            out_c = channels[len(channels) - 2 - i] if i < len(channels) - 1 else c
+            self.upsamples.append(nn.ConvTranspose2d(in_c, out_c, 2, 2) if i < len(channels) - 1 else nn.Identity())
+            self.u_blocks.append(nn.ModuleList(
+                [ResBlock(out_c * 2, out_c, cond_channels, a)] + 
+                [ResBlock(out_c, out_c, cond_channels, a) for _ in range(d - 1)]
+            ))
+
+    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+        skips = []
+        # Encoder pass
+        for i, (downsample, blocks) in enumerate(zip(self.downsamples, self.d_blocks)):
+            x = downsample(x)
+            for block in blocks:
+                x = block(x, cond)
+            skips.append(x)
+        
+        # Bottleneck pass
+        x = self.mid_block(x, cond)
+
+        # Decoder pass
+        for i, (upsample, blocks) in enumerate(zip(self.upsamples, self.u_blocks)):
+            x = upsample(x)
+            skip = skips[len(skips) - 2 - i]
+            x = torch.cat((x, skip), dim=1)
+            for block in blocks:
+                x = block(x, cond)
+        return x
+
+# =================================================================================
+#  --- InnerModel and UltrasoundDenoiser Adapter (Unchanged) ---
+# =================================================================================
+
+class InnerModel(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.is_upsampler = cfg.is_upsampler
+        self.noise_emb = FourierFeatures(cfg.cond_channels)
+        self.noise_cond_emb = FourierFeatures(cfg.cond_channels)
+        self.act_emb = None if self.is_upsampler else nn.Sequential(
+            nn.Linear(cfg.num_actions, cfg.cond_channels),
+        )
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cfg.cond_channels, cfg.cond_channels),
+            nn.SiLU(),
+            nn.Linear(cfg.cond_channels, cfg.cond_channels),
+        )
+        in_channels = (cfg.num_steps_conditioning + int(self.is_upsampler) + 1) * cfg.img_channels
+        self.conv_in = nn.Conv2d(in_channels, cfg.channels[0], 3, 1, 1)
+        self.unet = UNet(cfg.cond_channels, cfg.depths, cfg.channels, [bool(a) for a in cfg.attn_depths])
+        self.norm_out = GroupNorm(cfg.channels[0])
+        self.conv_out = nn.Conv2d(cfg.channels[0], cfg.img_channels, 3, 1, 1)
+        nn.init.zeros_(self.conv_out.weight)
+
+    def forward(self, noisy_next_obs: Tensor, c_noise: Tensor, c_noise_cond: Tensor, obs: Tensor, act: Optional[Tensor]) -> Tensor:
+        act_emb = 0 if self.is_upsampler else self.act_emb(act)
+        cond = self.cond_proj(self.noise_emb(c_noise) + self.noise_cond_emb(c_noise_cond) + act_emb)
+        x = self.conv_in(torch.cat((obs, noisy_next_obs), dim=1))
+        x = self.unet(x, cond)
+        x = self.conv_out(F.silu(self.norm_out(x)))
+        return x
+
+class UltrasoundDenoiser(nn.Module):
+    def __init__(self, history_len=4, pose_dim=7, **kwargs):
+        super().__init__()
+        self.pose_dim = pose_dim
+
+        class InnerModelConfig:
+            img_channels = 3
+            num_steps_conditioning = history_len
+            num_actions = history_len * pose_dim 
+            is_upsampler = False
+            cond_channels = kwargs.get("cond_channels", 4096)  # Upsized for richer conditioning
+            depths = kwargs.get("depths", [3, 4, 4, 3])  # Upsized for deeper features
+            channels = kwargs.get("channels", [320, 640, 1280, 1280])  # Upsized for more capacity
+            attn_depths = kwargs.get("attn_depths", [False, False, True, True])  # Kept; attention in deeper layers
+
+        self.cfg = InnerModelConfig()
+        self.inner_model = InnerModel(self.cfg)
+        self.noise_previous_obs = False
+
+    def forward(self, context_imgs, context_deltas, noisy_target_img, sigmas):
+        B, T, C, H, W = context_imgs.shape
+        obs_cond = context_imgs.view(B, T * C, H, W)
+        act_cond = context_deltas.view(B, T * self.pose_dim)
+        c_noise_cond = sigmas
+        c_noise_prev_obs = torch.zeros_like(sigmas)
+        if self.noise_previous_obs:
+            raise NotImplementedError("noise_previous_obs regularization not implemented.")
+
+        return self.inner_model(
+            noisy_next_obs=noisy_target_img,
+            c_noise=c_noise_cond,
+            c_noise_cond=c_noise_prev_obs,
+            obs=obs_cond,
+            act=act_cond
+        )
 
 # =================================================================================
 #                                --- MAIN SCRIPT ---
@@ -301,8 +555,8 @@ def main(args):
     print(f"PDFs will be saved to: ./pdf_outputs/")
     print(f"Checkpoints will be saved to: {checkpoint_dir}/")
 
-    train_dataset = CTSequenceDataset(train_patient_dirs, args.sequences_per_patient, single_patient=(args.use_single_patient or args.single_patient is not None))
-    val_dataset = CTSequenceDataset(val_patient_dirs, args.val_sequences, is_val=True, single_patient=(args.use_single_patient or args.single_patient is not None))
+    train_dataset = CTSequenceDataset(train_patient_dirs, args.sequences_per_patient, single_patient=(args.use_single_patient or args.single_patient is not None), use_knn=True)
+    val_dataset = CTSequenceDataset(val_patient_dirs, args.val_sequences, is_val=True, single_patient=(args.use_single_patient or args.single_patient is not None), use_knn=True)
     
     if len(train_dataset) == 0:
         print("Error: Training dataset is empty. Check data paths.")
