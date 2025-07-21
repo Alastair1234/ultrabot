@@ -157,9 +157,6 @@ def eval_epoch(model, loader, criterion):
     return total_loss / len(loader), np.vstack(preds), np.vstack(labels_list)
 
 def main(args):
-    # Enable Flash Attention globally (for broader application, including in DinoV2 encoder if compatible)
-    torch.backends.cuda.enable_flash_sdp(True)
-
     # Suppress Torch Dynamo errors (fallback to eager if compile fails)
     torch._dynamo.config.suppress_errors = True
 

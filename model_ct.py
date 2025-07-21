@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoImageProcessor
+from torch.nn.attention import sdpa_kernel, SDPBackend  # Added for new Flash Attention API
 
 class DinoV2PairTransformer(nn.Module):
     def __init__(self, 
                  output_dim=7, 
-                 vision_model='facebook/webssl-dino300m-full2b-224',  # Your requested model
+                 vision_model='facebook/webssl-dino1b-full2b-224',  # Your requested model
                  hidden_dim=768, 
                  nhead=8, 
                  num_layers=2,
@@ -15,7 +16,7 @@ class DinoV2PairTransformer(nn.Module):
         self.processor = AutoImageProcessor.from_pretrained(
             vision_model, 
             do_rescale=False, 
-            use_fast=True,  # Re-added to use fast processor
+            use_fast=True,  # Uses fast processor
             size={'height': 224, 'width': 224}  # Explicitly set to 224x224
         )
         self.encoder = AutoModel.from_pretrained(vision_model)
@@ -53,12 +54,8 @@ class DinoV2PairTransformer(nn.Module):
 
         projected_embed = self.projector(combined_embed).unsqueeze(1)
 
-        # Enable Flash Attention for the transformer (memory-efficient)
-        with torch.backends.cuda.sdp_kernel(
-            enable_flash=True,    # Flash Attention
-            enable_math=False,    # Disable fallback
-            enable_mem_efficient=False  # Prioritize flash over mem-efficient
-        ):
+        # Use the new recommended API for Flash Attention (fixes deprecation)
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             transformer_out = self.transformer_encoder(projected_embed).squeeze(1)
 
         return self.regressor(transformer_out)
