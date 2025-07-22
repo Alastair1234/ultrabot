@@ -13,6 +13,7 @@ from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import argparse
+from torch.utils.tensorboard import SummaryWriter  # For TensorBoard logging
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -86,9 +87,9 @@ def angular_distance(q1, q2):
     relative_rotation = r1.inv() * r2
     return relative_rotation.magnitude() * (180 / np.pi)
 
-def plot_results(preds, labels, epoch, save_dir, mean, std):
+def plot_results(preds, labels, step, save_dir, mean, std):
     os.makedirs(save_dir, exist_ok=True)
-    pdf_path = os.path.join(save_dir, f'results_epoch_{epoch}.pdf')
+    pdf_path = os.path.join(save_dir, f'results_step_{step}.pdf')
 
     preds_denorm = preds * std + mean
     labels_denorm = labels * std + mean
@@ -119,24 +120,6 @@ def plot_results(preds, labels, epoch, save_dir, mean, std):
         plt.grid(True)
         pdf.savefig()
         plt.close()
-
-def train_epoch(model, loader, criterion, optimizer, scaler):
-    model.train()
-    total_loss = 0
-    for img1, img2, img3, delta_p1_p2, labels in tqdm(loader, desc='Training'):
-        img1, img2, img3, delta_p1_p2, labels = (
-            img1.to(device), img2.to(device), img3.to(device),
-            delta_p1_p2.to(device), labels.to(device)
-        )
-        optimizer.zero_grad()
-        with amp.autocast(device_type='cuda'):
-            outputs = model(img1, img2, img3, delta_p1_p2)
-            loss = criterion(outputs, labels)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        total_loss += loss.item()
-    return total_loss / len(loader)
 
 def eval_epoch(model, loader, criterion):
     model.eval()
@@ -189,25 +172,64 @@ def main(args):
 
     output_dir = f"./training_runs/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     os.makedirs(output_dir, exist_ok=True)
+    log_dir = os.path.join(output_dir, 'logs')
+    writer = SummaryWriter(log_dir=log_dir)  # TensorBoard writer
 
-    for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, scaler)
-        val_loss, preds, labels = eval_epoch(model, val_loader, criterion)
-        print(f"Epoch {epoch}/{args.epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+    # Infinite train iterator
+    train_iter = iter(train_loader)
 
-        if epoch % args.checkpoint_freq == 0 or epoch == args.epochs:
-            torch.save(model.state_dict(), os.path.join(output_dir, f"model_epoch_{epoch}.pth"))
-            plot_results(preds, labels, epoch, output_dir, val_dataset.mean, val_dataset.std)
+    global_step = 0
+    with tqdm(total=args.total_steps, desc="Training Steps") as pbar:
+        while global_step < args.total_steps:
+            try:
+                img1, img2, img3, delta_p1_p2, labels = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)  # Reset iterator for continuous training
+                img1, img2, img3, delta_p1_p2, labels = next(train_iter)
+
+            img1, img2, img3, delta_p1_p2, labels = (
+                img1.to(device), img2.to(device), img3.to(device),
+                delta_p1_p2.to(device), labels.to(device)
+            )
+
+            model.train()
+            optimizer.zero_grad()
+            with amp.autocast(device_type='cuda'):
+                outputs = model(img1, img2, img3, delta_p1_p2)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            # Log train loss to TensorBoard
+            writer.add_scalar('Loss/train', loss.item(), global_step)
+
+            global_step += 1
+            pbar.update(1)
+
+            # Validation every val_freq steps
+            if global_step % args.val_freq == 0 or global_step == args.total_steps:
+                val_loss, preds, val_labels = eval_epoch(model, val_loader, criterion)
+                writer.add_scalar('Loss/val', val_loss, global_step)
+                print(f"Step {global_step}/{args.total_steps}, Val Loss: {val_loss:.4f}")
+                plot_results(preds, val_labels, global_step, output_dir, val_dataset.mean, val_dataset.std)
+
+            # Checkpoint every checkpoint_freq steps
+            if global_step % args.checkpoint_freq == 0 or global_step == args.total_steps:
+                torch.save(model.state_dict(), os.path.join(output_dir, f"model_step_{global_step}.pth"))
+
+    writer.close()  # Close TensorBoard writer
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', default='./ct_data_random_angle')
-    parser.add_argument('--epochs', default=20, type=int)
-    parser.add_argument('--batch_size', default=32, type=int)  # Reduce to 8-16 if OOM with 224x224
+    parser.add_argument('--total_steps', default=500000, type=int)  # New: total training steps
+    parser.add_argument('--batch_size', default=16, type=int)  # Reduced default for safety
     parser.add_argument('--lr', default=1e-5, type=float)
     parser.add_argument('--pairs_per_patient', default=2000, type=int)
     parser.add_argument('--val_pairs', default=500, type=int)
-    parser.add_argument('--checkpoint_freq', default=10, type=int)
+    parser.add_argument('--checkpoint_freq', default=10000, type=int)  # Save every N steps
+    parser.add_argument('--val_freq', default=1000, type=int)  # Validate every N steps
     parser.add_argument('--single_patient', action='store_true')
     args = parser.parse_args()
 
