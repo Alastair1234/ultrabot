@@ -8,13 +8,14 @@ import datetime
 from torch.utils.data import Dataset, DataLoader
 from torch import nn, optim, amp
 from tqdm import tqdm
-from model_ct import DinoV2PairTransformer  # Import from model_ct.py
+from model_ct import DinoV2PairTransformer  # Import from your separate model_ct.py
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import argparse
-from torch.utils.tensorboard import SummaryWriter  # For TensorBoard logging
-from torch.optim.lr_scheduler import ReduceLROnPlateau  # Added for LR scheduling
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import torchvision.utils as vutils  # For image grids in logging
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -122,26 +123,8 @@ def plot_results(preds, labels, step, save_dir, mean, std):
         pdf.savefig()
         plt.close()
 
-def eval_epoch(model, loader, criterion):
-    model.eval()
-    total_loss = 0
-    preds, labels_list = [], []
-    with torch.no_grad():
-        for img1, img2, img3, delta_p1_p2, labels in tqdm(loader, desc='Evaluating'):
-            img1, img2, img3, delta_p1_p2, labels = (
-                img1.to(device), img2.to(device), img3.to(device),
-                delta_p1_p2.to(device), labels.to(device)
-            )
-            with amp.autocast(device_type='cuda'):
-                output = model(img1, img2, img3, delta_p1_p2)
-                loss = criterion(output, labels)
-            total_loss += loss.item()
-            preds.append(output.cpu().numpy())
-            labels_list.append(labels.cpu().numpy())
-    return total_loss / len(loader), np.vstack(preds), np.vstack(labels_list)
-
 class CustomPoseLoss(nn.Module):
-    def __init__(self, pos_weight=1.0, rot_weight=5.0):
+    def __init__(self, pos_weight=1.0, rot_weight=20.0):
         super().__init__()
         self.mse = nn.MSELoss()
         self.pos_weight = pos_weight
@@ -158,13 +141,91 @@ class CustomPoseLoss(nn.Module):
         # Position: MSE
         pos_loss = self.mse(pred_pos, target_pos)
 
-        # Rotation: Geodesic (angular) loss
-        dot_product = torch.abs(torch.sum(pred_quat * target_quat, dim=1))
-        dot_product = torch.clamp(dot_product, -1.0, 1.0)  # Numerical stability
-        angle = 2 * torch.acos(dot_product)
+        # Rotation: Geodesic with antipodal handling (min dist to q or -q)
+        dot = torch.sum(pred_quat * target_quat, dim=1)
+        dot_neg = torch.sum(pred_quat * (-target_quat), dim=1)
+        dot = torch.max(dot.abs(), dot_neg.abs())  # Abs and max for antipodal equivalence
+        dot = torch.clamp(dot, -1.0, 1.0)  # Numerical stability
+        angle = 2 * torch.acos(dot)
         rot_loss = angle.mean()  # Mean angular error in radians
 
         return self.pos_weight * pos_loss + self.rot_weight * rot_loss
+
+def eval_epoch(model, loader, criterion, writer=None, step=0, dataset=None, num_examples=5):
+    model.eval()
+    total_loss = 0
+    preds, labels_list = [], []
+    example_data = []  # For high-error examples
+
+    with torch.no_grad():
+        for batch_idx, (img1, img2, img3, delta_p1_p2, labels) in enumerate(tqdm(loader, desc='Evaluating')):
+            img1, img2, img3, delta_p1_p2, labels = (
+                img1.to(device), img2.to(device), img3.to(device),
+                delta_p1_p2.to(device), labels.to(device)
+            )
+            with amp.autocast(device_type='cuda'):
+                output = model(img1, img2, img3, delta_p1_p2)
+                batch_loss = criterion(output, labels)
+
+                # Compute per-sample losses for sorting
+                per_sample_losses = torch.stack([
+                    criterion(output[i].unsqueeze(0), labels[i].unsqueeze(0)) for i in range(output.size(0))
+                ]).cpu().numpy()
+
+            total_loss += batch_loss.item()
+            preds.append(output.cpu().numpy())
+            labels_list.append(labels.cpu().numpy())
+
+            # Collect example data
+            for i in range(output.size(0)):
+                example_data.append({
+                    'img1': img1[i].cpu(), 'img2': img2[i].cpu(), 'img3': img3[i].cpu(),
+                    'delta_p1_p2': delta_p1_p2[i].cpu().numpy(),
+                    'pred': output[i].cpu().numpy(),
+                    'label': labels[i].cpu().numpy(),
+                    'loss': per_sample_losses[i]
+                })
+
+    avg_loss = total_loss / len(loader)
+    preds_np = np.vstack(preds)
+    labels_np = np.vstack(labels_list)
+
+    # Compute additional metrics
+    preds_denorm = preds_np * dataset.std + dataset.mean
+    labels_denorm = labels_np * dataset.std + dataset.mean
+    pos_rmse = np.sqrt(np.mean((labels_denorm[:, :3] - preds_denorm[:, :3])**2))
+    angular_errors = np.array([angular_distance(labels_denorm[i, 3:], preds_denorm[i, 3:]) for i in range(len(labels_denorm))])
+    mean_angular = np.mean(angular_errors)
+
+    # Sort and log top N high-error examples to TensorBoard
+    if writer:
+        example_data.sort(key=lambda x: x['loss'], reverse=True)
+        top_examples = example_data[:num_examples]
+        for idx, ex in enumerate(top_examples):
+            # Denormalize
+            pred_denorm = ex['pred'] * dataset.std + dataset.mean
+            label_denorm = ex['label'] * dataset.std + dataset.mean
+            delta_denorm = ex['delta_p1_p2'] * dataset.std + dataset.mean
+
+            # Per-example metrics
+            ex_pos_rmse = np.sqrt(np.mean((label_denorm[:3] - pred_denorm[:3])**2))
+            ex_angular_err = angular_distance(label_denorm[3:], pred_denorm[3:])
+
+            # Text log
+            text = (
+                f"Example {idx+1} (Loss: {ex['loss']:.4f})\n"
+                f"Delta P1-P2: {delta_denorm}\n"
+                f"True Label (P2-P3): Pos {label_denorm[:3]}, Quat {label_denorm[3:]}\n"
+                f"Pred: Pos {pred_denorm[:3]}, Quat {pred_denorm[3:]}\n"
+                f"Pos RMSE: {ex_pos_rmse:.4f}, Angular Err: {ex_angular_err:.4f}°"
+            )
+            writer.add_text(f"Val_Examples/Text_{idx+1}", text, step)
+
+            # Image grid log (img1 | img2 | img3)
+            img_grid = vutils.make_grid([ex['img1'], ex['img2'], ex['img3']], nrow=3, normalize=True)
+            writer.add_image(f"Val_Examples/Images_{idx+1}", img_grid, step)
+
+    return avg_loss, preds_np, labels_np, pos_rmse, mean_angular
 
 def main(args):
     # Suppress Torch Dynamo errors (fallback to eager if compile fails)
@@ -189,13 +250,13 @@ def main(args):
     ).to(device)
     
     # Enable gradient checkpointing to mitigate OOM with larger inputs/model
-    model.encoder.gradient_checkpointing = True
+    model.encoder.gradient_checkpointing = True  # Assuming encoder is part of model
     
     model = torch.compile(model)  # Optional; comment out if issues persist
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-    criterion = CustomPoseLoss(pos_weight=1.0, rot_weight=5.0)  # New custom loss
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=500, verbose=True)  # New LR scheduler
+    criterion = CustomPoseLoss(pos_weight=1.0, rot_weight=args.rot_weight)  # Updated with arg
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=500, verbose=True)
     scaler = amp.GradScaler()
 
     output_dir = f"./training_runs/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -230,22 +291,32 @@ def main(args):
             scaler.step(optimizer)
             scaler.update()
 
-            # Log train loss to TensorBoard
+            # Log train loss and separate pos/rot to TensorBoard
             writer.add_scalar('Loss/train', loss.item(), global_step)
-            # Optional: Log separate pos/rot losses (uncomment if desired)
-            # pos_loss = criterion.mse(outputs[:, :3], labels[:, :3])
-            # rot_loss = (2 * torch.acos(torch.clamp(torch.abs(torch.sum(nn.functional.normalize(outputs[:, 3:], dim=1) * nn.functional.normalize(labels[:, 3:], dim=1), dim=1)), -1.0, 1.0))).mean()
-            # writer.add_scalar('Loss/train_pos', pos_loss.item(), global_step)
-            # writer.add_scalar('Loss/train_rot', rot_loss.item(), global_step)
+            pos_loss = criterion.mse(outputs[:, :3], labels[:, :3])
+            pred_quat = nn.functional.normalize(outputs[:, 3:], dim=1)
+            target_quat = nn.functional.normalize(labels[:, 3:], dim=1)
+            dot = torch.max(
+                torch.sum(pred_quat * target_quat, dim=1).abs(),
+                torch.sum(pred_quat * (-target_quat), dim=1).abs()
+            )
+            dot = torch.clamp(dot, -1.0, 1.0)
+            rot_loss = (2 * torch.acos(dot)).mean()
+            writer.add_scalar('Loss/train_pos', pos_loss.item(), global_step)
+            writer.add_scalar('Loss/train_rot', rot_loss.item(), global_step)
 
             global_step += 1
             pbar.update(1)
 
             # Validation every val_freq steps
             if global_step % args.val_freq == 0 or global_step == args.total_steps:
-                val_loss, preds, val_labels = eval_epoch(model, val_loader, criterion)
+                val_loss, preds, val_labels, pos_rmse, mean_angular = eval_epoch(
+                    model, val_loader, criterion, writer=writer, step=global_step, dataset=val_dataset
+                )
                 writer.add_scalar('Loss/val', val_loss, global_step)
-                print(f"Step {global_step}/{args.total_steps}, Val Loss: {val_loss:.4f}")
+                writer.add_scalar('Metrics/pos_rmse', pos_rmse, global_step)
+                writer.add_scalar('Metrics/mean_angular_error', mean_angular, global_step)
+                print(f"Step {global_step}/{args.total_steps}, Val Loss: {val_loss:.4f}, Pos RMSE: {pos_rmse:.4f}, Angular Error: {mean_angular:.4f}")
                 plot_results(preds, val_labels, global_step, output_dir, val_dataset.mean, val_dataset.std)
                 
                 # Step the scheduler with val_loss
@@ -262,14 +333,15 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', default='../ct_data_random_angle')
-    parser.add_argument('--total_steps', default=500000, type=int)  # New: total training steps
-    parser.add_argument('--batch_size', default=16, type=int)  # Reduced default for safety
+    parser.add_argument('--total_steps', default=500000, type=int)
+    parser.add_argument('--batch_size', default=16, type=int)
     parser.add_argument('--lr', default=1e-5, type=float)
     parser.add_argument('--pairs_per_patient', default=2000, type=int)
     parser.add_argument('--val_pairs', default=500, type=int)
-    parser.add_argument('--checkpoint_freq', default=10000, type=int)  # Save every N steps
-    parser.add_argument('--val_freq', default=1000, type=int)  # Validate every N steps
+    parser.add_argument('--checkpoint_freq', default=10000, type=int)
+    parser.add_argument('--val_freq', default=1000, type=int)
     parser.add_argument('--single_patient', action='store_true')
+    parser.add_argument('--rot_weight', default=20.0, type=float)  # New arg for rot emphasis
     args = parser.parse_args()
 
     main(args)
