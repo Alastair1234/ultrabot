@@ -222,7 +222,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_root', default='./ct_data_random_angle')
+    parser.add_argument('--data_root', default='../ct_data_random_angle')
     parser.add_argument('--total_steps', default=500000, type=int)  # New: total training steps
     parser.add_argument('--batch_size', default=16, type=int)  # Reduced default for safety
     parser.add_argument('--lr', default=1e-5, type=float)
