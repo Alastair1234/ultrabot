@@ -6,7 +6,7 @@ from torch.nn.attention import sdpa_kernel, SDPBackend  # Added for new Flash At
 class DinoV2PairTransformer(nn.Module):
     def __init__(self, 
                  output_dim=7, 
-                 vision_model='facebook/webssl-dino1b-full2b-224',  # Your requested model
+                 vision_model='facebook/webssl-dino300m-full2b-224',  # Aligned to match main script
                  hidden_dim=768, 
                  nhead=8, 
                  num_layers=2,
