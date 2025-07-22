@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import argparse
 from torch.utils.tensorboard import SummaryWriter  # For TensorBoard logging
+from torch.optim.lr_scheduler import ReduceLROnPlateau  # Added for LR scheduling
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -139,6 +140,32 @@ def eval_epoch(model, loader, criterion):
             labels_list.append(labels.cpu().numpy())
     return total_loss / len(loader), np.vstack(preds), np.vstack(labels_list)
 
+class CustomPoseLoss(nn.Module):
+    def __init__(self, pos_weight=1.0, rot_weight=5.0):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.pos_weight = pos_weight
+        self.rot_weight = rot_weight
+
+    def forward(self, pred, target):
+        pred_pos, pred_quat = pred[:, :3], pred[:, 3:]
+        target_pos, target_quat = target[:, :3], target[:, 3:]
+
+        # Normalize quats (in case of drift)
+        pred_quat = nn.functional.normalize(pred_quat, p=2, dim=1)
+        target_quat = nn.functional.normalize(target_quat, p=2, dim=1)
+
+        # Position: MSE
+        pos_loss = self.mse(pred_pos, target_pos)
+
+        # Rotation: Geodesic (angular) loss
+        dot_product = torch.abs(torch.sum(pred_quat * target_quat, dim=1))
+        dot_product = torch.clamp(dot_product, -1.0, 1.0)  # Numerical stability
+        angle = 2 * torch.acos(dot_product)
+        rot_loss = angle.mean()  # Mean angular error in radians
+
+        return self.pos_weight * pos_loss + self.rot_weight * rot_loss
+
 def main(args):
     # Suppress Torch Dynamo errors (fallback to eager if compile fails)
     torch._dynamo.config.suppress_errors = True
@@ -158,7 +185,7 @@ def main(args):
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     model = DinoV2PairTransformer(
-        vision_model='facebook/webssl-dino300m-full2b-224'  # Your requested model
+        vision_model='facebook/webssl-dino300m-full2b-224'  # Aligned to match
     ).to(device)
     
     # Enable gradient checkpointing to mitigate OOM with larger inputs/model
@@ -167,7 +194,8 @@ def main(args):
     model = torch.compile(model)  # Optional; comment out if issues persist
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
+    criterion = CustomPoseLoss(pos_weight=1.0, rot_weight=5.0)  # New custom loss
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=500, verbose=True)  # New LR scheduler
     scaler = amp.GradScaler()
 
     output_dir = f"./training_runs/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -198,11 +226,17 @@ def main(args):
                 outputs = model(img1, img2, img3, delta_p1_p2)
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping for stability
             scaler.step(optimizer)
             scaler.update()
 
             # Log train loss to TensorBoard
             writer.add_scalar('Loss/train', loss.item(), global_step)
+            # Optional: Log separate pos/rot losses (uncomment if desired)
+            # pos_loss = criterion.mse(outputs[:, :3], labels[:, :3])
+            # rot_loss = (2 * torch.acos(torch.clamp(torch.abs(torch.sum(nn.functional.normalize(outputs[:, 3:], dim=1) * nn.functional.normalize(labels[:, 3:], dim=1), dim=1)), -1.0, 1.0))).mean()
+            # writer.add_scalar('Loss/train_pos', pos_loss.item(), global_step)
+            # writer.add_scalar('Loss/train_rot', rot_loss.item(), global_step)
 
             global_step += 1
             pbar.update(1)
@@ -213,6 +247,11 @@ def main(args):
                 writer.add_scalar('Loss/val', val_loss, global_step)
                 print(f"Step {global_step}/{args.total_steps}, Val Loss: {val_loss:.4f}")
                 plot_results(preds, val_labels, global_step, output_dir, val_dataset.mean, val_dataset.std)
+                
+                # Step the scheduler with val_loss
+                scheduler.step(val_loss)
+                # Log current learning rate
+                writer.add_scalar('LR', optimizer.param_groups[0]['lr'], global_step)
 
             # Checkpoint every checkpoint_freq steps
             if global_step % args.checkpoint_freq == 0 or global_step == args.total_steps:
