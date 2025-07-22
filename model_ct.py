@@ -1,34 +1,42 @@
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoImageProcessor
-from torch.nn.attention import sdpa_kernel, SDPBackend  # Added for new Flash Attention API
+from torch.nn.attention import sdpa_kernel, SDPBackend  # For Flash Attention API
 
 class DinoV2PairTransformer(nn.Module):
     def __init__(self, 
-                 output_dim=7, 
-                 vision_model='facebook/webssl-dino300m-full2b-224',  # Aligned to match main script
-                 hidden_dim=768, 
-                 nhead=8, 
-                 num_layers=2,
-                 delta_input_dim=7):
+                 output_dim=7,  # 3 for position + 4 for quaternion
+                 vision_model='facebook/webssl-dino300m-full2b-224',  # Pretrained DinoV2 model
+                 hidden_dim=768,  # Hidden dimension for projector and transformer
+                 nhead=8,  # Number of attention heads
+                 num_layers=2,  # Number of transformer layers
+                 delta_input_dim=7):  # Input dim for delta_p1_p2 (3 pos + 4 quat)
         super().__init__()
 
+        # Image processor for preprocessing (resizes to 224x224, no rescaling)
         self.processor = AutoImageProcessor.from_pretrained(
             vision_model, 
             do_rescale=False, 
-            use_fast=True,  # Uses fast processor
-            size={'height': 224, 'width': 224}  # Explicitly set to 224x224
+            use_fast=True,  # Faster processing
+            size={'height': 224, 'width': 224}  # Explicit size for consistency
         )
-        self.encoder = AutoModel.from_pretrained(vision_model)
-        encoder_dim = self.encoder.config.hidden_size
 
-        # Now we have embeddings of img pairs + delta input
+        # Load the pretrained DinoV2 encoder
+        self.encoder = AutoModel.from_pretrained(vision_model)
+        encoder_dim = self.encoder.config.hidden_size  # e.g., 768 for many Dino models
+
+        # Projector: Combines pair embeddings (4 * encoder_dim) + delta_input_dim to hidden_dim
         self.projector = nn.Linear(4 * encoder_dim + delta_input_dim, hidden_dim)
 
+        # Transformer encoder layer
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=nhead, batch_first=True)
+            d_model=hidden_dim, 
+            nhead=nhead, 
+            batch_first=True  # Batch dimension first
+        )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
+        # Regressor head: From transformer output to final predictions
         self.regressor = nn.Sequential(
             nn.Linear(hidden_dim, 256),
             nn.BatchNorm1d(256),
@@ -38,24 +46,35 @@ class DinoV2PairTransformer(nn.Module):
         )
 
     def forward(self, img1, img2, img3, delta_p1_p2):
+        # Preprocess images (assumes img1/2/3 are tensors in [batch, C, H, W])
         inputs_1 = self.processor(img1, return_tensors="pt").to(img1.device)
         inputs_2 = self.processor(img2, return_tensors="pt").to(img2.device)
         inputs_3 = self.processor(img3, return_tensors="pt").to(img3.device)
 
+        # Extract CLS embeddings (global features) from each image
         embed_1 = self.encoder(**inputs_1).last_hidden_state[:, 0, :]
         embed_2 = self.encoder(**inputs_2).last_hidden_state[:, 0, :]
         embed_3 = self.encoder(**inputs_3).last_hidden_state[:, 0, :]
 
+        # Pair embeddings: Cat for (img1, img2) and (img2, img3)
         pair_embed_1_2 = torch.cat([embed_1, embed_2], dim=1)
         pair_embed_2_3 = torch.cat([embed_2, embed_3], dim=1)
 
-        # Explicitly include delta_p1_p2 embedding
+        # Combine with delta_p1_p2
         combined_embed = torch.cat([pair_embed_1_2, pair_embed_2_3, delta_p1_p2], dim=1)
 
+        # Project to hidden_dim and add sequence dim for transformer (treat as seq len=1)
         projected_embed = self.projector(combined_embed).unsqueeze(1)
 
-        # Use the new recommended API for Flash Attention (fixes deprecation)
+        # Apply transformer with Flash Attention for efficiency
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             transformer_out = self.transformer_encoder(projected_embed).squeeze(1)
 
-        return self.regressor(transformer_out)
+        # Regress to output
+        outputs = self.regressor(transformer_out)
+
+        # Enforce quaternion normalization (for rotation stability; assumes outputs[:, 3:] are quats)
+        pos = outputs[:, :3]
+        quat = outputs[:, 3:]
+        quat = nn.functional.normalize(quat, p=2, dim=1)  # Unit norm
+        return torch.cat([pos, quat], dim=1)
