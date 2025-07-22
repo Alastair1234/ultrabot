@@ -1,4 +1,3 @@
-
 import os
 import json
 import torch
@@ -49,8 +48,6 @@ class CTDataset(Dataset):
         print(f"Dataset normalization mean: {self.mean}, std: {self.std}")
 
     def calc_label(self, p1, p2):
-        pos1 = np.array([p1['Position']['x'], p1['Position']['y'], p1['Position']['z']])
-        pos2 = np.array([p2['Position']['x'], p2['Position']['y'], p2['Position']['z']])
         q1 = np.array([
             p1['RotationQuaternion']['x'], p1['RotationQuaternion']['y'],
             p1['RotationQuaternion']['z'], p1['RotationQuaternion']['w']
@@ -60,9 +57,8 @@ class CTDataset(Dataset):
             p2['RotationQuaternion']['z'], p2['RotationQuaternion']['w']
         ])
 
-        pos_diff = pos2 - pos1
         quat_diff = (R.from_quat(q2) * R.from_quat(q1).inv()).as_quat()
-        return np.concatenate([pos_diff, quat_diff])
+        return quat_diff  # Only rotation (4D quaternion)
 
     def __len__(self):
         return len(self.data_triplets)
@@ -96,24 +92,10 @@ def plot_results(preds, labels, step, save_dir, mean, std):
     preds_denorm = preds * std + mean
     labels_denorm = labels * std + mean
 
-    pred_pos, true_pos = preds_denorm[:, :3], labels_denorm[:, :3]
-    pred_quat, true_quat = preds_denorm[:, 3:], labels_denorm[:, 3:]
-
-    pos_rmse = np.sqrt(np.mean((true_pos - pred_pos)**2, axis=0))
-    angular_errors = np.array([angular_distance(t, p) for t, p in zip(true_quat, pred_quat)])
+    angular_errors = np.array([angular_distance(t, p) for t, p in zip(labels_denorm, preds_denorm)])
     mean_angular_error = angular_errors.mean()
 
     with PdfPages(pdf_path) as pdf:
-        plt.figure(figsize=(8, 8))
-        plt.scatter(true_pos[:, 0], pred_pos[:, 0], alpha=0.3)
-        plt.plot([true_pos.min(), true_pos.max()], [true_pos.min(), true_pos.max()], 'r--')
-        plt.xlabel('True Position X')
-        plt.ylabel('Predicted Position X')
-        plt.title(f'Positional RMSE X: {pos_rmse[0]:.4f} m')
-        plt.grid(True)
-        pdf.savefig()
-        plt.close()
-
         plt.figure(figsize=(8, 8))
         plt.hist(angular_errors, bins=50, color='green', alpha=0.7)
         plt.xlabel('Angular Error (degrees)')
@@ -142,22 +124,13 @@ def eval_epoch(model, loader, criterion):
     return total_loss / len(loader), np.vstack(preds), np.vstack(labels_list)
 
 class CustomPoseLoss(nn.Module):
-    def __init__(self, pos_weight=1.0, rot_weight=5.0):
+    def __init__(self):
         super().__init__()
-        self.mse = nn.MSELoss()
-        self.pos_weight = pos_weight
-        self.rot_weight = rot_weight
 
     def forward(self, pred, target):
-        pred_pos, pred_quat = pred[:, :3], pred[:, 3:]
-        target_pos, target_quat = target[:, :3], target[:, 3:]
-
         # Normalize quats (in case of drift)
-        pred_quat = nn.functional.normalize(pred_quat, p=2, dim=1)
-        target_quat = nn.functional.normalize(target_quat, p=2, dim=1)
-
-        # Position: MSE
-        pos_loss = self.mse(pred_pos, target_pos)
+        pred_quat = nn.functional.normalize(pred, p=2, dim=1)
+        target_quat = nn.functional.normalize(target, p=2, dim=1)
 
         # Rotation: Geodesic (angular) loss
         dot_product = torch.abs(torch.sum(pred_quat * target_quat, dim=1))
@@ -165,7 +138,7 @@ class CustomPoseLoss(nn.Module):
         angle = 2 * torch.acos(dot_product)
         rot_loss = angle.mean()  # Mean angular error in radians
 
-        return self.pos_weight * pos_loss + self.rot_weight * rot_loss
+        return rot_loss
 
 def main(args):
     # Suppress Torch Dynamo errors (fallback to eager if compile fails)
@@ -188,14 +161,14 @@ def main(args):
     model = DinoV2PairTransformer(
         vision_model='facebook/webssl-dino300m-full2b-224'  # Aligned to match
     ).to(device)
-    
+
     # Enable gradient checkpointing to mitigate OOM with larger inputs/model
     model.encoder.gradient_checkpointing = True
-    
+
     model = torch.compile(model)  # Optional; comment out if issues persist
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-    criterion = CustomPoseLoss(pos_weight=1.0, rot_weight=5.0)  # New custom loss
+    criterion = CustomPoseLoss()  # Only rotation loss
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=500, verbose=True)  # New LR scheduler
     scaler = amp.GradScaler()
 
@@ -233,11 +206,8 @@ def main(args):
 
             # Log train loss to TensorBoard
             writer.add_scalar('Loss/train', loss.item(), global_step)
-            # Optional: Log separate pos/rot losses (uncomment if desired)
-            # pos_loss = criterion.mse(outputs[:, :3], labels[:, :3])
-            # rot_loss = (2 * torch.acos(torch.clamp(torch.abs(torch.sum(nn.functional.normalize(outputs[:, 3:], dim=1) * nn.functional.normalize(labels[:, 3:], dim=1), dim=1)), -1.0, 1.0))).mean()
-            # writer.add_scalar('Loss/train_pos', pos_loss.item(), global_step)
-            # writer.add_scalar('Loss/train_rot', rot_loss.item(), global_step)
+            # Optional: Log rotation loss (it's the only component)
+            # writer.add_scalar('Loss/train_rot', loss.item(), global_step)
 
             global_step += 1
             pbar.update(1)
