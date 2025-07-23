@@ -5,12 +5,12 @@ from torch.nn.attention import sdpa_kernel, SDPBackend  # For Flash Attention AP
 
 class DinoV2PairTransformer(nn.Module):
     def __init__(self,
-                 output_dim=4,  # 4 for quaternion (rotation only)
+                 output_dim=6,  # 6 for 6D rotation representation
                  vision_model='facebook/webssl-dino300m-full2b-224',  # Pretrained DinoV2 model
                  hidden_dim=768,  # Hidden dimension for projector and transformer
                  nhead=8,  # Number of attention heads
                  num_layers=2,  # Number of transformer layers
-                 delta_input_dim=4):  # Input dim for delta_p1_p2 (4 quat only)
+                 delta_input_dim=6):  # Input dim for delta_p1_p2 (6D now)
         super().__init__()
 
         # Image processor for preprocessing (resizes to 224x224, no rescaling)
@@ -70,9 +70,6 @@ class DinoV2PairTransformer(nn.Module):
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             transformer_out = self.transformer_encoder(projected_embed).squeeze(1)
 
-        # Regress to output
+        # Regress to output (no normalization needed for 6D)
         outputs = self.regressor(transformer_out)
-
-        # Enforce quaternion normalization (for rotation stability)
-        quat = nn.functional.normalize(outputs, p=2, dim=1)  # Unit norm
-        return quat
+        return outputs
