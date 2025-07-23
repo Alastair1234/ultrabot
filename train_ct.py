@@ -47,6 +47,12 @@ class CTDataset(Dataset):
 
         print(f"Dataset normalization mean: {self.mean}, std: {self.std}")
 
+    def quat_to_6d(self, quat):
+        """Convert quaternion [x,y,z,w] to 6D representation (first two rows of rot matrix)."""
+        rot = R.from_quat(quat).as_matrix()  # 3x3 rotation matrix
+        sixd = rot[:2, :].reshape(6)  # Flatten first two rows [r00, r01, r02, r10, r11, r12]
+        return sixd
+
     def calc_label(self, p1, p2):
         q1 = np.array([
             p1['RotationQuaternion']['x'], p1['RotationQuaternion']['y'],
@@ -58,7 +64,7 @@ class CTDataset(Dataset):
         ])
 
         quat_diff = (R.from_quat(q2) * R.from_quat(q1).inv()).as_quat()
-        return quat_diff  # Only rotation (4D quaternion)
+        return self.quat_to_6d(quat_diff)  # Convert to 6D (rotation only)
 
     def __len__(self):
         return len(self.data_triplets)
@@ -80,8 +86,28 @@ class CTDataset(Dataset):
 
         return img1, img2, img3, torch.tensor(delta_p1_p2).float(), torch.tensor(label_p2_p3).float()
 
-def angular_distance(q1, q2):
-    r1, r2 = R.from_quat(q1), R.from_quat(q2)
+def sixd_to_rotmat(sixd):
+    """Convert 6D vector to 3x3 rotation matrix using Gram-Schmidt orthogonalization."""
+    if isinstance(sixd, np.ndarray):
+        sixd = torch.from_numpy(sixd).float()
+    elif isinstance(sixd, list):
+        sixd = torch.tensor(sixd).float()
+    
+    a1 = sixd[:3]  # First row
+    a2 = sixd[3:6]  # Second row
+    
+    b1 = nn.functional.normalize(a1, p=2, dim=0)  # Normalize first vector
+    b2 = a2 - (b1 * torch.dot(b1, a2))  # Orthogonalize second
+    b2 = nn.functional.normalize(b2, p=2, dim=0)
+    b3 = torch.cross(b1, b2)  # Third vector as cross product (right-handed)
+    
+    rotmat = torch.stack([b1, b2, b3], dim=0)  # 3x3 matrix
+    return rotmat
+
+def angular_distance(s1, s2):
+    """Angular distance between two 6D vectors (convert to rotmats first)."""
+    r1 = R.from_matrix(sixd_to_rotmat(s1).numpy())
+    r2 = R.from_matrix(sixd_to_rotmat(s2).numpy())
     relative_rotation = r1.inv() * r2
     return relative_rotation.magnitude() * (180 / np.pi)
 
@@ -128,17 +154,15 @@ class CustomPoseLoss(nn.Module):
         super().__init__()
 
     def forward(self, pred, target):
-        # Normalize quats (in case of drift)
-        pred_quat = nn.functional.normalize(pred, p=2, dim=1)
-        target_quat = nn.functional.normalize(target, p=2, dim=1)
-
-        # Rotation: Geodesic (angular) loss
-        dot_product = torch.abs(torch.sum(pred_quat * target_quat, dim=1))
-        dot_product = torch.clamp(dot_product, -1.0, 1.0)  # Numerical stability
-        angle = 2 * torch.acos(dot_product)
-        rot_loss = angle.mean()  # Mean angular error in radians
-
-        return rot_loss
+        # Simple MSE on 6D vectors (Euclidean space)
+        mse_loss = nn.functional.mse_loss(pred, target)
+        
+        # Optional: Add loss on orthogonalized rotmats for better stability
+        pred_rot = torch.stack([sixd_to_rotmat(p) for p in pred])
+        target_rot = torch.stack([sixd_to_rotmat(t) for t in target])
+        rot_loss = nn.functional.mse_loss(pred_rot, target_rot)
+        
+        return mse_loss + 0.5 * rot_loss  # Weighted sum (adjust weight if needed)
 
 def main(args):
     # Suppress Torch Dynamo errors (fallback to eager if compile fails)
@@ -168,7 +192,7 @@ def main(args):
     model = torch.compile(model)  # Optional; comment out if issues persist
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-    criterion = CustomPoseLoss()  # Only rotation loss
+    criterion = CustomPoseLoss()  # Updated for 6D
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=500, verbose=True)  # New LR scheduler
     scaler = amp.GradScaler()
 
