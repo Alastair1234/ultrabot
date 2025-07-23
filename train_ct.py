@@ -165,12 +165,10 @@ class CustomPoseLoss(nn.Module):
         # Simple MSE on raw 9D vectors (position-like, Euclidean)
         mse_loss = nn.functional.mse_loss(pred, target)
         
-        # Optional: Add MSE on orthogonalized rotmats for stability (batched)
-        pred_rot = nine_d_to_rotmat(pred)  # [batch, 3, 3]
-        target_rot = nine_d_to_rotmat(target)  # [batch, 3, 3]
-        rot_loss = nn.functional.mse_loss(pred_rot, target_rot)  # Frobenius-like
         
-        return mse_loss + 0.5 * rot_loss  # Weighted sum (adjust weight or set to 0 for pure MSE)
+        
+        
+        return mse_loss  # Weighted sum (adjust weight or set to 0 for pure MSE)
 
 def main(args):
     # Suppress Torch Dynamo errors (fallback to eager if compile fails)
