@@ -102,12 +102,13 @@ def nine_d_to_rotmat(nine_d):
     vt = vt.to(torch.float32)
     ortho_mats = torch.bmm(u, vt).to(torch.float32)  # Initial ortho mats
     
-    # Ensure det=1 (proper rotation) for each
+    # Ensure det=1 (proper rotation) for each - clone u to avoid inplace issues
     dets = torch.det(ortho_mats).to(torch.float32)  # Compute det in float32
+    u_clone = u.clone()  # Clone to avoid inplace modification error
     for i in range(batch_size):
         if dets[i] < 0:
-            u[i, :, -1] = -u[i, :, -1]  # Flip last column of u for this batch item
-    ortho_mats = torch.bmm(u, vt).to(torch.float32)  # Recompute after potential flips
+            u_clone[i, :, -1] = -u_clone[i, :, -1]  # Flip on clone
+    ortho_mats = torch.bmm(u_clone, vt).to(torch.float32)  # Recompute using clone
     
     return ortho_mats
 
