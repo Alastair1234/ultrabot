@@ -47,11 +47,11 @@ class CTDataset(Dataset):
 
         print(f"Dataset normalization mean: {self.mean}, std: {self.std}")
 
-    def quat_to_6d(self, quat):
-        """Convert quaternion [x,y,z,w] to 6D representation (first two rows of rot matrix)."""
+    def quat_to_9d(self, quat):
+        """Convert quaternion [x,y,z,w] to 9D flattened rotation matrix."""
         rot = R.from_quat(quat).as_matrix()  # 3x3 rotation matrix
-        sixd = rot[:2, :].reshape(6)  # Flatten first two rows [r00, r01, r02, r10, r11, r12]
-        return sixd
+        nine_d = rot.reshape(9)  # Flatten to [r00, r01, r02, r10, ...]
+        return nine_d
 
     def calc_label(self, p1, p2):
         q1 = np.array([
@@ -64,7 +64,7 @@ class CTDataset(Dataset):
         ])
 
         quat_diff = (R.from_quat(q2) * R.from_quat(q1).inv()).as_quat()
-        return self.quat_to_6d(quat_diff)  # Convert to 6D (rotation only)
+        return self.quat_to_9d(quat_diff)  # Convert to 9D (rotation only)
 
     def __len__(self):
         return len(self.data_triplets)
@@ -86,28 +86,29 @@ class CTDataset(Dataset):
 
         return img1, img2, img3, torch.tensor(delta_p1_p2).float(), torch.tensor(label_p2_p3).float()
 
-def sixd_to_rotmat(sixd):
-    """Convert 6D vector to 3x3 rotation matrix using Gram-Schmidt orthogonalization."""
-    if isinstance(sixd, np.ndarray):
-        sixd = torch.from_numpy(sixd).float()
-    elif isinstance(sixd, list):
-        sixd = torch.tensor(sixd).float()
+def nine_d_to_rotmat(nine_d):
+    """Convert batched 9D vectors [batch, 9] to orthogonal 3x3 rotation matrices [batch, 3, 3] using SVD."""
+    if isinstance(nine_d, np.ndarray):
+        nine_d = torch.from_numpy(nine_d).float()
     
-    a1 = sixd[:3]  # First row
-    a2 = sixd[3:6]  # Second row
+    batch_size = nine_d.shape[0]
+    mats = nine_d.reshape(batch_size, 3, 3)  # [batch, 3, 3]
     
-    b1 = nn.functional.normalize(a1, p=2, dim=0)  # Normalize first vector
-    b2 = a2 - (b1 * torch.dot(b1, a2))  # Orthogonalize second
-    b2 = nn.functional.normalize(b2, p=2, dim=0)
-    b3 = torch.cross(b1, b2)  # Third vector as cross product (right-handed)
+    # SVD for each matrix in the batch
+    u, s, vt = torch.linalg.svd(mats)  # u [batch, 3, 3], s [batch, 3], vt [batch, 3, 3]
+    ortho_mats = torch.bmm(u, vt)  # u @ vt for each batch
     
-    rotmat = torch.stack([b1, b2, b3], dim=0)  # 3x3 matrix
-    return rotmat
+    # Ensure det=1 (proper rotation) for each
+    dets = torch.det(ortho_mats)
+    signs = torch.sign(dets).view(batch_size, 1, 1)
+    ortho_mats = ortho_mats * signs  # Flip if needed (simple approximation; for exact, adjust u last col)
+    
+    return ortho_mats
 
-def angular_distance(s1, s2):
-    """Angular distance between two 6D vectors (convert to rotmats first)."""
-    r1 = R.from_matrix(sixd_to_rotmat(s1).numpy())
-    r2 = R.from_matrix(sixd_to_rotmat(s2).numpy())
+def angular_distance(n1, n2):
+    """Angular distance between two 9D vectors (convert to rotmats first). Assumes single pair; vectorize if needed."""
+    r1 = R.from_matrix(nine_d_to_rotmat(n1[None, :])[0].numpy())  # Add batch dim and squeeze
+    r2 = R.from_matrix(nine_d_to_rotmat(n2[None, :])[0].numpy())
     relative_rotation = r1.inv() * r2
     return relative_rotation.magnitude() * (180 / np.pi)
 
@@ -154,15 +155,15 @@ class CustomPoseLoss(nn.Module):
         super().__init__()
 
     def forward(self, pred, target):
-        # Simple MSE on 6D vectors (Euclidean space)
+        # Simple MSE on raw 9D vectors (position-like, Euclidean)
         mse_loss = nn.functional.mse_loss(pred, target)
         
-        # Optional: Add loss on orthogonalized rotmats for better stability
-        pred_rot = torch.stack([sixd_to_rotmat(p) for p in pred])
-        target_rot = torch.stack([sixd_to_rotmat(t) for t in target])
-        rot_loss = nn.functional.mse_loss(pred_rot, target_rot)
+        # Optional: Add MSE on orthogonalized rotmats for stability (batched)
+        pred_rot = nine_d_to_rotmat(pred)  # [batch, 3, 3]
+        target_rot = nine_d_to_rotmat(target)  # [batch, 3, 3]
+        rot_loss = nn.functional.mse_loss(pred_rot, target_rot)  # Frobenius-like
         
-        return mse_loss + 0.5 * rot_loss  # Weighted sum (adjust weight if needed)
+        return mse_loss + 0.5 * rot_loss  # Weighted sum (adjust weight or set to 0 for pure MSE)
 
 def main(args):
     # Suppress Torch Dynamo errors (fallback to eager if compile fails)
@@ -192,7 +193,7 @@ def main(args):
     model = torch.compile(model)  # Optional; comment out if issues persist
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-    criterion = CustomPoseLoss()  # Updated for 6D
+    criterion = CustomPoseLoss()  # Updated for 9D
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=500, verbose=True)  # New LR scheduler
     scaler = amp.GradScaler()
 
