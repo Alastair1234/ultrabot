@@ -91,6 +91,8 @@ def nine_d_to_rotmat(nine_d):
     if isinstance(nine_d, np.ndarray):
         nine_d = torch.from_numpy(nine_d).float()
     
+    nine_d = nine_d.to(torch.float32)  # Cast to float32 to support SVD (fixes half-precision error)
+    
     batch_size = nine_d.shape[0]
     mats = nine_d.reshape(batch_size, 3, 3)  # [batch, 3, 3]
     
@@ -100,8 +102,10 @@ def nine_d_to_rotmat(nine_d):
     
     # Ensure det=1 (proper rotation) for each
     dets = torch.det(ortho_mats)
-    signs = torch.sign(dets).view(batch_size, 1, 1)
-    ortho_mats = ortho_mats * signs  # Flip if needed (simple approximation; for exact, adjust u last col)
+    for i in range(batch_size):
+        if dets[i] < 0:
+            u[i, :, -1] = -u[i, :, -1]  # Flip last column of u for this batch item
+    ortho_mats = torch.bmm(u, vt)  # Recompute after potential flips
     
     return ortho_mats
 
