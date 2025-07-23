@@ -91,21 +91,23 @@ def nine_d_to_rotmat(nine_d):
     if isinstance(nine_d, np.ndarray):
         nine_d = torch.from_numpy(nine_d).float()
     
-    nine_d = nine_d.to(torch.float32)  # Cast to float32 to support SVD (fixes half-precision error)
+    nine_d = nine_d.to(torch.float32)  # Ensure input is float32
     
     batch_size = nine_d.shape[0]
-    mats = nine_d.reshape(batch_size, 3, 3)  # [batch, 3, 3]
+    mats = nine_d.reshape(batch_size, 3, 3).to(torch.float32)  # [batch, 3, 3], explicit cast
     
-    # SVD for each matrix in the batch
+    # SVD for each matrix in the batch (in float32)
     u, s, vt = torch.linalg.svd(mats)  # u [batch, 3, 3], s [batch, 3], vt [batch, 3, 3]
-    ortho_mats = torch.bmm(u, vt)  # u @ vt for each batch
+    u = u.to(torch.float32)
+    vt = vt.to(torch.float32)
+    ortho_mats = torch.bmm(u, vt).to(torch.float32)  # Initial ortho mats
     
     # Ensure det=1 (proper rotation) for each
-    dets = torch.det(ortho_mats)
+    dets = torch.det(ortho_mats).to(torch.float32)  # Compute det in float32
     for i in range(batch_size):
         if dets[i] < 0:
             u[i, :, -1] = -u[i, :, -1]  # Flip last column of u for this batch item
-    ortho_mats = torch.bmm(u, vt)  # Recompute after potential flips
+    ortho_mats = torch.bmm(u, vt).to(torch.float32)  # Recompute after potential flips
     
     return ortho_mats
 
