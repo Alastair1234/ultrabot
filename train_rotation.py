@@ -1,11 +1,11 @@
+
 # ==============================================================================
-# File: model_rotation_streamlined.py
+# File: model_rotation_final.py
 #
 # Description:
 # A streamlined script to train a transformer model to predict 3D rotation.
-# It uses a pre-trained DinoV2 backbone from Hugging Face and employs a
-# best-practice fine-tuning strategy with differential learning rates and a
-# cosine annealing scheduler.
+# This version includes the critical fix for using torch.linalg.svd inside an
+# amp.autocast context, which is required for mixed-precision training.
 # ==============================================================================
 
 import os
@@ -84,7 +84,6 @@ class RotationDataset(Dataset):
                 p1, p2, p3 = random.sample(points, 3)
                 self.data_triplets.append((images_dir, p1, p2, p3))
 
-        # Compute mean/std of 9D rotations for normalization
         all_quats = [self.get_quat(p) for _, p1, p2, p3 in self.data_triplets for p in [p1, p2, p3]]
         self.absolutes = np.array([self.quat_to_9d(q) for q in all_quats])
         self.mean = self.absolutes.mean(axis=0)
@@ -111,9 +110,13 @@ class RotationDataset(Dataset):
 # --------------- 3. Loss Function and Metrics ---------------
 
 def nine_d_to_rotmat(nine_d):
-    """Converts a 9D vector back to a 3x3 rotation matrix using SVD."""
+    """(CORRECTED) Converts a 9D vector back to a 3x3 rotation matrix using SVD."""
     b, _ = nine_d.shape
-    mats = nine_d.view(b, 3, 3)
+    ## --- FIX ---
+    # The SVD operation on GPU does not support float16 (half) tensors.
+    # We must cast the input to float32 before calling torch.linalg.svd.
+    mats = nine_d.view(b, 3, 3).to(torch.float32)
+    
     U, _, Vt = torch.linalg.svd(mats)
     det = torch.det(U @ Vt)
     Vt_clone = Vt.clone()
@@ -121,9 +124,12 @@ def nine_d_to_rotmat(nine_d):
     return U @ Vt_clone
 
 def angular_distance(pred_9d, target_9d):
-    """Calculates the angular distance (in degrees)."""
-    pred_rot = nine_d_to_rotmat(pred_9d.cpu())
-    target_rot = nine_d_to_rotmat(target_9d.cpu())
+    """(CORRECTED) Calculates the angular distance (in degrees), keeping tensors on the GPU."""
+    ## --- FIX ---
+    # The .cpu() calls were removed for efficiency. The calculation now stays on the GPU.
+    pred_rot = nine_d_to_rotmat(pred_9d)
+    target_rot = nine_d_to_rotmat(target_9d)
+    
     relative = torch.bmm(pred_rot.transpose(1, 2), target_rot)
     traces = torch.einsum('bii->b', relative)
     return torch.acos(torch.clamp((traces - 1) / 2, -1.0 + 1e-7, 1.0 - 1e-7)) * (180.0 / np.pi)
@@ -164,7 +170,6 @@ def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
     writer.add_scalar('Metrics/mean_angular_error', np.mean(ang_errors), step)
     writer.add_histogram('Angular_Errors_val', ang_errors, step)
 
-    # Plot results
     pdf_path = os.path.join(output_dir, 'plots', f'results_step_{step}.pdf')
     os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
     preds_denorm = preds_np * std + mean
@@ -198,7 +203,6 @@ def main(args):
     model = DinoV2RotationTransformer().to(device)
     model.encoder.gradient_checkpointing_enable()
 
-    # --- Optimizer Setup with Differential Learning Rates ---
     backbone_params = model.encoder.parameters()
     head_params = [p for n, p in model.named_parameters() if not n.startswith('encoder.')]
     param_groups = [
