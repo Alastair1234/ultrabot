@@ -16,7 +16,6 @@ from torch.utils.tensorboard import SummaryWriter
 import logging
 from logging.handlers import RotatingFileHandler
 import time
-import timm
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
