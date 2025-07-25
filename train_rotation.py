@@ -1,10 +1,11 @@
 # ==============================================================================
-# File: model_rotation_stable_simple.py
+# File: model_rotation_robust_eval.py
 #
 # Description:
-# This version addresses the "NaN explosion" by simplifying the learning rate
-# schedule and adding a critical safety check inside the training loop to
-# detect non-finite loss values and stop training gracefully.
+# This version addresses the NaN explosion during validation by running the
+# evaluation loop in full float32 precision. This is the standard, robust
+# practice to guarantee numerical stability for metrics calculation, while
+# still using AMP for fast training.
 # ==============================================================================
 
 import os
@@ -25,7 +26,6 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModel, AutoImageProcessor
-# --- SIMPLIFIED: Only need the standard cosine scheduler ---
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -83,7 +83,7 @@ class RotationDataset(Dataset):
         input_abs = np.concatenate([abs_p1, abs_p2])
         return (img1, img2, img3, torch.tensor(input_abs).float(), torch.tensor(abs_p3_label).float())
 
-# --------------- 3. Loss Function and Metrics (Unchanged, with previous fixes) ---------------
+# --------------- 3. Loss Function and Metrics (Unchanged) ---------------
 def nine_d_to_rotmat(nine_d):
     b, _ = nine_d.shape
     mats = nine_d.view(b, 3, 3).to(torch.float32)
@@ -110,17 +110,21 @@ class RotationLoss(nn.Module):
         angular_loss_term = torch.mean(angular_distance(pred_9d, target_9d).to(device))
         return chordal_loss + self.angular_weight * angular_loss_term
 
-# --------------- 4. Evaluation and Plotting (Unchanged) ---------------
+# --------------- 4. Evaluation and Plotting (MODIFIED) ---------------
 def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
     model.eval()
     total_loss, all_preds, all_labels = 0, [], []
     with torch.no_grad():
         for batch in tqdm(loader, desc='Evaluating', leave=False):
             img1, img2, img3, input_abs, abs_p3 = [b.to(device) for b in batch]
-            with amp.autocast(device_type='cuda'):
-                output = model(img1, img2, img3, input_abs)
-                loss = criterion(output, abs_p3)
-            # Check for NaN in validation loss calculation
+            
+            # --- ROBUSTNESS FIX ---
+            # REMOVED `with amp.autocast(...)` from evaluation.
+            # Run validation in full float32 to prevent numerical instability issues (NaNs).
+            # This is standard practice.
+            output = model(img1, img2, img3, input_abs)
+            loss = criterion(output, abs_p3)
+            
             if torch.isnan(loss):
                 logging.warning(f"NaN loss detected during validation at step {step}. Skipping batch.")
                 continue
@@ -139,7 +143,7 @@ def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
     errors_denorm = angular_distance(torch.tensor(preds_np * std + mean), torch.tensor(labels_np * std + mean)).numpy()
     with PdfPages(pdf_path) as pdf: plt.figure(); plt.hist(errors_denorm, bins=50); plt.title(f'Angular Error @ Step {step} (Mean: {np.mean(errors_denorm):.2f})'); pdf.savefig(); plt.close()
 
-# --------------- 5. Main Training Loop (Updated) ---------------
+# --------------- 5. Main Training Loop (Unchanged) ---------------
 def main(args):
     output_dir = f"./rotation_training_runs/{datetime.datetime.now().strftime('%Y%b%d_%H-%M-%S')}"
     os.makedirs(output_dir, exist_ok=True)
@@ -166,7 +170,6 @@ def main(args):
         {'params': [p for n, p in model.named_parameters() if not n.startswith('encoder.')], 'lr': args.lr_head}
     ]
     optimizer = optim.AdamW(param_groups)
-    # --- SIMPLIFIED SCHEDULER ---
     scheduler = CosineAnnealingLR(optimizer, T_max=args.total_steps)
     criterion = RotationLoss()
     scaler = amp.GradScaler()
@@ -185,12 +188,8 @@ def main(args):
             outputs = model(img1, img2, img3, input_abs)
             loss = criterion(outputs, abs_p3)
 
-        # --- IMPORTANT SAFETY CHECK ---
-        # Stop training if the loss becomes NaN or infinity.
         if not torch.isfinite(loss):
             logging.error(f"Non-finite loss detected at step {step}: {loss.item()}. Stopping training.")
-            # You could add more debugging here, e.g., save the batch that caused the error
-            # torch.save({'batch': batch, 'model_state': model.state_dict()}, os.path.join(output_dir, 'error_dump.pth'))
             break
 
         scaler.scale(loss).backward()
@@ -215,9 +214,8 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a DinoV2-based Rotation Transformer.")
     parser.add_argument('--data_root', type=str, default='../ct_data_rotation_only')
-    # --- Using more conservative learning rates to start ---
-    parser.add_argument('--lr_head', type=float, default=5e-5, help='Peak learning rate for the new layers.')
-    parser.add_argument('--lr_backbone', type=float, default=5e-6, help='Peak learning rate for the backbone.')
+    parser.add_argument('--lr_head', type=float, default=2e-5, help='Peak learning rate for the new layers.')
+    parser.add_argument('--lr_backbone', type=float, default=2e-6, help='Peak learning rate for the backbone.')
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--total_steps', type=int, default=20000)
     parser.add_argument('--val_freq', type=int, default=1000)
