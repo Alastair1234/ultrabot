@@ -3,73 +3,96 @@ import torch.nn as nn
 from transformers import AutoModel, AutoImageProcessor
 from torch.nn.attention import sdpa_kernel, SDPBackend  # For Flash Attention API
 
-class DinoV2PairTransformer(nn.Module):
-    def __init__(self,
-                 output_dim=9,  # 9 for 9D rotation matrix representation
-                 vision_model='facebook/webssl-dino300m-full2b-224',  # Pretrained DinoV2 model
-                 hidden_dim=768,  # Hidden dimension for projector and transformer
-                 nhead=8,  # Number of attention heads
-                 num_layers=2,  # Number of transformer layers
-                 delta_input_dim=9):  # Input dim for delta_p1_p2 (9D now)
+# --------------- 1. The Model Definition (Extended for Position) ---------------
+class DinoV2RotationPositionTransformer(nn.Module):
+    def __init__(self, embed_dim=384, num_heads=6, depth=3, mlp_ratio=4, rot_dim=9, pos_dim=3):
         super().__init__()
-
-        # Image processor for preprocessing (resizes to 224x224, no rescaling)
-        self.processor = AutoImageProcessor.from_pretrained(
-            vision_model, 
-            do_rescale=False, 
-            use_fast=True,  # Faster processing
-            size={'height': 224, 'width': 224}  # Explicit size for consistency
+        self.encoder = AutoModel.from_pretrained('facebook/dinov2-base')
+        encoder_dim = self.encoder.config.hidden_size
+        
+        # Add dropout for regularization
+        self.dropout = nn.Dropout(0.1)
+        
+        # Separate embedders for rotation and position
+        self.rot_embedder = nn.Linear(rot_dim, encoder_dim)
+        self.pos_embedder = nn.Linear(pos_dim, encoder_dim)
+        nn.init.xavier_uniform_(self.rot_embedder.weight, gain=0.1)
+        nn.init.zeros_(self.rot_embedder.bias)
+        nn.init.xavier_uniform_(self.pos_embedder.weight, gain=0.1)
+        nn.init.zeros_(self.pos_embedder.bias)
+        
+        # Add layer normalization
+        self.layer_norm1 = nn.LayerNorm(encoder_dim)
+        self.layer_norm2 = nn.LayerNorm(encoder_dim)
+        
+        self.projector = nn.Linear(encoder_dim * 3, embed_dim)
+        nn.init.xavier_uniform_(self.projector.weight, gain=0.1)
+        nn.init.zeros_(self.projector.bias)
+        
+        transformer_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads, dim_feedforward=int(mlp_ratio * embed_dim),
+            activation='gelu', batch_first=True, dropout=0.1
         )
+        self.transformer = nn.TransformerEncoder(transformer_layer, num_layers=depth)
+        
+        # Separate heads for rotation and position
+        self.rotation_head = nn.Linear(embed_dim, 9)
+        self.position_head = nn.Linear(embed_dim, 3)
+        nn.init.xavier_uniform_(self.rotation_head.weight, gain=0.01)
+        nn.init.zeros_(self.rotation_head.bias)
+        nn.init.xavier_uniform_(self.position_head.weight, gain=0.01)
+        nn.init.zeros_(self.position_head.bias)
 
-        # Load the pretrained DinoV2 encoder
-        self.encoder = AutoModel.from_pretrained(vision_model)
-        encoder_dim = self.encoder.config.hidden_size  # e.g., 768 for many Dino models
-
-        # Projector: Combines pair embeddings (4 * encoder_dim) + delta_input_dim to hidden_dim
-        self.projector = nn.Linear(4 * encoder_dim + delta_input_dim, hidden_dim)
-
-        # Transformer encoder layer
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, 
-            nhead=nhead, 
-            batch_first=True  # Batch dimension first
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # Regressor head: From transformer output to final predictions
-        self.regressor = nn.Sequential(
-            nn.Linear(hidden_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, output_dim)
-        )
-
-    def forward(self, img1, img2, img3, delta_p1_p2):
-        # Preprocess images (assumes img1/2/3 are tensors in [batch, C, H, W])
-        inputs_1 = self.processor(img1, return_tensors="pt").to(img1.device)
-        inputs_2 = self.processor(img2, return_tensors="pt").to(img2.device)
-        inputs_3 = self.processor(img3, return_tensors="pt").to(img3.device)
-
-        # Extract CLS embeddings (global features) from each image
-        embed_1 = self.encoder(**inputs_1).last_hidden_state[:, 0, :]
-        embed_2 = self.encoder(**inputs_2).last_hidden_state[:, 0, :]
-        embed_3 = self.encoder(**inputs_3).last_hidden_state[:, 0, :]
-
-        # Pair embeddings: Cat for (img1, img2) and (img2, img3)
-        pair_embed_1_2 = torch.cat([embed_1, embed_2], dim=1)
-        pair_embed_2_3 = torch.cat([embed_2, embed_3], dim=1)
-
-        # Combine with delta_p1_p2
-        combined_embed = torch.cat([pair_embed_1_2, pair_embed_2_3, delta_p1_p2], dim=1)
-
-        # Project to hidden_dim and add sequence dim for transformer (treat as seq len=1)
-        projected_embed = self.projector(combined_embed).unsqueeze(1)
-
-        # Apply transformer with Flash Attention for efficiency
-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-            transformer_out = self.transformer_encoder(projected_embed).squeeze(1)
-
-        # Regress to output (no normalization - raw 9D like positions)
-        outputs = self.regressor(transformer_out)
-        return outputs
+    def forward(self, img1, img2, img3, input_abs):
+        # Get features and apply layer norm
+        feat1 = self.layer_norm1(self.encoder(img1).last_hidden_state[:, 0])
+        feat2 = self.layer_norm1(self.encoder(img2).last_hidden_state[:, 0])
+        feat3 = self.layer_norm1(self.encoder(img3).last_hidden_state[:, 0])
+        
+        # Split input into rotations and positions for points 1 and 2
+        # input_abs shape: [batch, 24] = [rot1(9) + pos1(3) + rot2(9) + pos2(3)]
+        abs_rot1, abs_pos1 = input_abs[:, :9], input_abs[:, 9:12]
+        abs_rot2, abs_pos2 = input_abs[:, 12:21], input_abs[:, 21:24]
+        
+        # Clamp inputs to prevent extreme values
+        abs_rot1 = torch.clamp(abs_rot1, -10, 10)
+        abs_rot2 = torch.clamp(abs_rot2, -10, 10)
+        abs_pos1 = torch.clamp(abs_pos1, -1000, 1000)  # Reasonable position bounds
+        abs_pos2 = torch.clamp(abs_pos2, -1000, 1000)
+        
+        # Embed rotations and positions separately, then combine
+        rot_emb1 = self.layer_norm2(self.rot_embedder(abs_rot1))
+        pos_emb1 = self.layer_norm2(self.pos_embedder(abs_pos1))
+        rot_emb2 = self.layer_norm2(self.rot_embedder(abs_rot2))
+        pos_emb2 = self.layer_norm2(self.pos_embedder(abs_pos2))
+        
+        # Fuse features (additive fusion)
+        fused_feat1 = feat1 + rot_emb1 + pos_emb1
+        fused_feat2 = feat2 + rot_emb2 + pos_emb2
+        
+        # Apply dropout
+        fused_feat1 = self.dropout(fused_feat1)
+        fused_feat2 = self.dropout(fused_feat2)
+        feat3 = self.dropout(feat3)
+        
+        # Combine and project
+        combined = torch.cat([fused_feat1, fused_feat2, feat3], dim=1)
+        projected = self.projector(combined).unsqueeze(1)
+        
+        # Apply transformer
+        transformer_out = self.transformer(projected).squeeze(1)
+        
+        # Separate heads for rotation and position
+        rotation_output = self.rotation_head(transformer_out)
+        position_output = self.position_head(transformer_out)
+        
+        # Apply constraints
+        # Normalize rotation output to prevent extreme values
+        rot_norm = torch.norm(rotation_output, dim=1, keepdim=True)
+        max_rot_norm = 3.0
+        rotation_output = rotation_output * torch.clamp(max_rot_norm / (rot_norm + 1e-8), max=1.0)
+        
+        # Concatenate outputs: [rotation(9) + position(3)]
+        output = torch.cat([rotation_output, position_output], dim=1)
+        
+        return output
