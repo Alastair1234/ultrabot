@@ -32,7 +32,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 class DinoV2RotationPositionTransformer(nn.Module):
     def __init__(self, embed_dim=384, num_heads=6, depth=3, mlp_ratio=4, rot_dim=9, pos_dim=3):
         super().__init__()
-        self.encoder = AutoModel.from_pretrained('facebook/dinov2-small')
+        self.encoder = AutoModel.from_pretrained('facebook/dinov2-base')
         encoder_dim = self.encoder.config.hidden_size
         
         # Add dropout for regularization
