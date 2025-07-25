@@ -1,0 +1,84 @@
+# Training outputs and data directories
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Training runs and checkpoints
+rotation_position_training_runs/
+training_runs/
+checkpoints/
+outputs/
+logs/
+runs/
+wandb/
+
+# Data directories (adjust paths as needed)
+ct_data*/
+data/
+dataset/
+datasets/
+
+# Model files
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.h5
+*.hdf5
+
+# Cache and temporary files
+.cache/
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment files
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# pytest cache
+.pytest_cache/
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# TensorBoard logs
+tensorboard_logs/
+
+# HuggingFace cache
+.cache/huggingface/
