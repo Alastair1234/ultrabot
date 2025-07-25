@@ -1,11 +1,10 @@
 # ==============================================================================
-# File: model_rotation_robust_eval.py
+# File: model_rotation_final_smooth.py
 #
 # Description:
-# This version addresses the NaN explosion during validation by running the
-# evaluation loop in full float32 precision. This is the standard, robust
-# practice to guarantee numerical stability for metrics calculation, while
-# still using AMP for fast training.
+# This version adds an Exponential Moving Average (EMA) to the loss display
+# in the progress bar. This provides a much smoother, less "jumpy" view of the
+# training trend, while still logging the true, raw loss for accurate analysis.
 # ==============================================================================
 
 import os
@@ -110,21 +109,15 @@ class RotationLoss(nn.Module):
         angular_loss_term = torch.mean(angular_distance(pred_9d, target_9d).to(device))
         return chordal_loss + self.angular_weight * angular_loss_term
 
-# --------------- 4. Evaluation and Plotting (MODIFIED) ---------------
+# --------------- 4. Evaluation and Plotting (Unchanged from robust version) ---------------
 def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
     model.eval()
     total_loss, all_preds, all_labels = 0, [], []
     with torch.no_grad():
         for batch in tqdm(loader, desc='Evaluating', leave=False):
             img1, img2, img3, input_abs, abs_p3 = [b.to(device) for b in batch]
-            
-            # --- ROBUSTNESS FIX ---
-            # REMOVED `with amp.autocast(...)` from evaluation.
-            # Run validation in full float32 to prevent numerical instability issues (NaNs).
-            # This is standard practice.
             output = model(img1, img2, img3, input_abs)
             loss = criterion(output, abs_p3)
-            
             if torch.isnan(loss):
                 logging.warning(f"NaN loss detected during validation at step {step}. Skipping batch.")
                 continue
@@ -143,7 +136,7 @@ def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
     errors_denorm = angular_distance(torch.tensor(preds_np * std + mean), torch.tensor(labels_np * std + mean)).numpy()
     with PdfPages(pdf_path) as pdf: plt.figure(); plt.hist(errors_denorm, bins=50); plt.title(f'Angular Error @ Step {step} (Mean: {np.mean(errors_denorm):.2f})'); pdf.savefig(); plt.close()
 
-# --------------- 5. Main Training Loop (Unchanged) ---------------
+# --------------- 5. Main Training Loop (MODIFIED) ---------------
 def main(args):
     output_dir = f"./rotation_training_runs/{datetime.datetime.now().strftime('%Y%b%d_%H-%M-%S')}"
     os.makedirs(output_dir, exist_ok=True)
@@ -177,6 +170,12 @@ def main(args):
 
     train_iter = iter(train_loader)
     pbar = tqdm(range(args.total_steps), desc="Training")
+    
+    # --- SMOOTHING FIX ---
+    # Initialize the exponential moving average for the loss
+    ema_loss = 0.0
+    smoothing_factor = 0.9
+
     for step in pbar:
         try: batch = next(train_iter)
         except StopIteration: train_iter = iter(train_loader); batch = next(train_iter)
@@ -187,9 +186,10 @@ def main(args):
         with amp.autocast(device_type='cuda'):
             outputs = model(img1, img2, img3, input_abs)
             loss = criterion(outputs, abs_p3)
-
-        if not torch.isfinite(loss):
-            logging.error(f"Non-finite loss detected at step {step}: {loss.item()}. Stopping training.")
+        
+        raw_loss = loss.item() # Get the raw loss value
+        if not np.isfinite(raw_loss): # Check with numpy isfinite for compatibility
+            logging.error(f"Non-finite loss detected at step {step}: {raw_loss}. Stopping training.")
             break
 
         scaler.scale(loss).backward()
@@ -199,8 +199,18 @@ def main(args):
         scaler.update()
         scheduler.step()
 
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
-        writer.add_scalar('Loss/train', loss.item(), step)
+        # --- SMOOTHING FIX ---
+        # Update the EMA of the loss
+        if step == 0:
+            ema_loss = raw_loss
+        else:
+            ema_loss = (smoothing_factor * ema_loss) + ((1 - smoothing_factor) * raw_loss)
+        
+        # Display the smoothed loss in the progress bar
+        pbar.set_postfix(smooth_loss=f"{ema_loss:.4f}")
+        
+        # Log the RAW loss to TensorBoard for accurate tracking
+        writer.add_scalar('Loss/train', raw_loss, step)
         writer.add_scalar('LR/head', optimizer.param_groups[1]['lr'], step)
         writer.add_scalar('LR/backbone', optimizer.param_groups[0]['lr'], step)
 
@@ -214,9 +224,9 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a DinoV2-based Rotation Transformer.")
     parser.add_argument('--data_root', type=str, default='../ct_data_rotation_only')
-    parser.add_argument('--lr_head', type=float, default=2e-5, help='Peak learning rate for the new layers.')
-    parser.add_argument('--lr_backbone', type=float, default=2e-6, help='Peak learning rate for the backbone.')
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--lr_head', type=float, default=5e-5, help='Peak learning rate for the new layers.')
+    parser.add_argument('--lr_backbone', type=float, default=5e-6, help='Peak learning rate for the backbone.')
+    parser.add_argument('--batch_size', type=int, default=64) # Default batch size is 16
     parser.add_argument('--total_steps', type=int, default=20000)
     parser.add_argument('--val_freq', type=int, default=1000)
     parser.add_argument('--pairs_per_patient', type=int, default=1000)
