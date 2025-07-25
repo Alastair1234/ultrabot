@@ -1,8 +1,9 @@
 # ==============================================================================
-# File: model_rotation_delta_fixed.py
+# File: model_rotation_delta_6d_complete.py
 #
 # Description:
-# Careful delta implementation based on the working absolute version
+# Complete 6D delta rotation prediction model
+# Based on "On the Continuity of Rotation Representations in Neural Networks"
 # ==============================================================================
 
 import os
@@ -27,9 +28,62 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# --------------- 1. The Model Definition (MINIMAL CHANGES FROM WORKING VERSION) ---------------
-class DinoV2RotationDeltaTransformer(nn.Module):
-    def __init__(self, embed_dim=384, num_heads=6, depth=3, mlp_ratio=4, rot_dim=9):
+# --------------- 6D ROTATION UTILITIES ---------------
+def rotation_matrix_to_6d(rot_matrices):
+    """Convert rotation matrices to 6D representation (first two columns)."""
+    # rot_matrices: (..., 3, 3) -> (..., 6)
+    return rot_matrices[..., :, :2].reshape(*rot_matrices.shape[:-2], 6)
+
+def rotation_6d_to_matrix(rot_6d):
+    """Convert 6D representation back to rotation matrix using Gram-Schmidt."""
+    batch_size = rot_6d.shape[0]
+    
+    # Reshape to get first two columns
+    a1 = rot_6d[:, :3]  # First column
+    a2 = rot_6d[:, 3:]  # Second column
+    
+    # Normalize first vector
+    b1 = a1 / (torch.norm(a1, dim=1, keepdim=True) + 1e-8)
+    
+    # Make second vector orthogonal to first
+    b2 = a2 - torch.sum(b1 * a2, dim=1, keepdim=True) * b1
+    b2 = b2 / (torch.norm(b2, dim=1, keepdim=True) + 1e-8)
+    
+    # Third column is cross product
+    b3 = torch.cross(b1, b2, dim=1)
+    
+    # Stack to form rotation matrix [b1, b2, b3]
+    rot_matrix = torch.stack([b1, b2, b3], dim=2)
+    
+    return rot_matrix
+
+def angular_distance_6d(pred_6d, target_6d):
+    """Compute angular distance between 6D representations."""
+    pred_rot = rotation_6d_to_matrix(pred_6d)
+    target_rot = rotation_6d_to_matrix(target_6d)
+    
+    # Compute relative rotation
+    relative = torch.bmm(pred_rot.transpose(1, 2), target_rot)
+    
+    # Extract trace with numerical stability
+    traces = torch.diagonal(relative, dim1=1, dim2=2).sum(dim=1)
+    traces = torch.clamp(traces, -3.0 + 1e-6, 3.0 - 1e-6)
+    
+    # Compute angle
+    cos_angle = (traces - 1) / 2
+    cos_angle = torch.clamp(cos_angle, -1.0 + 1e-7, 1.0 - 1e-7)
+    
+    angles_rad = torch.acos(cos_angle)
+    angles_deg = angles_rad * (180.0 / np.pi)
+    
+    # Replace any NaN with 180 degrees
+    angles_deg = torch.where(torch.isnan(angles_deg), torch.tensor(180.0, device=angles_deg.device), angles_deg)
+    
+    return angles_deg
+
+# --------------- 1. The Model Definition ---------------
+class DinoV2RotationDelta6D(nn.Module):
+    def __init__(self, embed_dim=384, num_heads=6, depth=3, mlp_ratio=4, rot_dim=6):
         super().__init__()
         self.encoder = AutoModel.from_pretrained('facebook/dinov2-small')
         encoder_dim = self.encoder.config.hidden_size
@@ -37,16 +91,16 @@ class DinoV2RotationDeltaTransformer(nn.Module):
         # Add dropout for regularization
         self.dropout = nn.Dropout(0.1)
         
-        # Better initialization for rotation embedder
-        self.rot_embedder = nn.Linear(rot_dim, encoder_dim)
-        nn.init.xavier_uniform_(self.rot_embedder.weight, gain=0.1)
-        nn.init.zeros_(self.rot_embedder.bias)
+        # 6D rotation delta embedder
+        self.rot_delta_embedder = nn.Linear(rot_dim, encoder_dim)
+        nn.init.xavier_uniform_(self.rot_delta_embedder.weight, gain=0.1)
+        nn.init.zeros_(self.rot_delta_embedder.bias)
         
         # Add layer normalization
         self.layer_norm1 = nn.LayerNorm(encoder_dim)
         self.layer_norm2 = nn.LayerNorm(encoder_dim)
         
-        # Same as working version - 3 features concatenated
+        # Project concatenated features (keeping 3 features like working version)
         self.projector = nn.Linear(encoder_dim * 3, embed_dim)
         nn.init.xavier_uniform_(self.projector.weight, gain=0.1)
         nn.init.zeros_(self.projector.bias)
@@ -57,87 +111,95 @@ class DinoV2RotationDeltaTransformer(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(transformer_layer, num_layers=depth)
         
-        # Constrained output layer with smaller initialization
-        self.regressor = nn.Linear(embed_dim, 9)
+        # Output 6D representation
+        self.regressor = nn.Linear(embed_dim, 6)
         nn.init.xavier_uniform_(self.regressor.weight, gain=0.01)
         nn.init.zeros_(self.regressor.bias)
 
-    def forward(self, img1, img2, img3, delta_12):
-        # Get features and apply layer norm to prevent explosion
+    def forward(self, img1, img2, img3, delta_12_6d):
+        # Get features and apply layer norm
         feat1 = self.layer_norm1(self.encoder(img1).last_hidden_state[:, 0])
         feat2 = self.layer_norm1(self.encoder(img2).last_hidden_state[:, 0])
         feat3 = self.layer_norm1(self.encoder(img3).last_hidden_state[:, 0])
         
-        # Constrain input delta
-        delta_12 = torch.clamp(delta_12, -10, 10)
+        # Embed the known 6D rotation delta
+        delta_emb = self.layer_norm2(self.rot_delta_embedder(delta_12_6d))
         
-        # Embed delta with normalization
-        delta_emb = self.layer_norm2(self.rot_embedder(delta_12))
-        
-        # Fuse img2 feature with delta context (img2 is the bridge between the delta and prediction)
+        # Fuse img2 feature with delta context (img2 is the bridge)
         fused_feat2 = feat2 + delta_emb
         
         # Apply dropout
+        feat1 = self.dropout(feat1)
         fused_feat2 = self.dropout(fused_feat2)
         feat3 = self.dropout(feat3)
-        feat1 = self.dropout(feat1)  # Still include img1 for context
         
-        # Combine and project (keeping same architecture as working version)
+        # Combine features (same order as working version)
         combined = torch.cat([feat1, fused_feat2, feat3], dim=1)
         projected = self.projector(combined).unsqueeze(1)
         
         # Apply transformer
         transformer_out = self.transformer(projected).squeeze(1)
         
-        # Constrained output - prevent explosion
-        raw_output = self.regressor(transformer_out)
+        # Output 6D representation (no special normalization needed!)
+        output_6d = self.regressor(transformer_out)
         
-        # Normalize output to prevent extreme values
-        output_norm = torch.norm(raw_output, dim=1, keepdim=True)
-        max_norm = 3.0  # Same as working version
-        output = raw_output * torch.clamp(max_norm / (output_norm + 1e-8), max=1.0)
-        
-        return output
+        return output_6d
 
-# --------------- 2. Dataset (FIXED DELTA COMPUTATION) ---------------
-class RotationDeltaDataset(Dataset):
+# --------------- 2. Dataset ---------------
+class RotationDelta6DDataset(Dataset):
     def __init__(self, patient_dirs, pairs_per_patient=1000):
         self.image_processor = AutoImageProcessor.from_pretrained('facebook/dinov2-small')
         self.data_triplets = []
         
+        print(f"Loading data from {len(patient_dirs)} patient directories...")
         for patient_dir in tqdm(patient_dirs, desc="Loading Data"):
             info_path = os.path.join(patient_dir, 'info.json')
             images_dir = os.path.join(patient_dir, 'images')
-            if not os.path.exists(info_path): continue
-            with open(info_path) as f: points = json.load(f)['PointInfos']
-            if len(points) < 3: continue
-            for _ in range(pairs_per_patient): self.data_triplets.append((images_dir, *random.sample(points, 3)))
-        
-        # More stable delta computation using quaternions
-        all_deltas = []
-        for _, p1, p2, p3 in self.data_triplets:
-            q1 = self.get_quat(p1)
-            q2 = self.get_quat(p2) 
-            q3 = self.get_quat(p3)
+            if not os.path.exists(info_path): 
+                continue
             
-            # Use quaternion difference for more stability
-            r1 = R.from_quat(q1)
-            r2 = R.from_quat(q2)
-            r3 = R.from_quat(q3)
+            with open(info_path) as f: 
+                points = json.load(f)['PointInfos']
+            if len(points) < 3: 
+                continue
+                
+            for _ in range(pairs_per_patient): 
+                self.data_triplets.append((images_dir, *random.sample(points, 3)))
+        
+        print(f"Created {len(self.data_triplets)} triplets. Computing 6D delta statistics...")
+        
+        # Compute 6D delta statistics
+        all_deltas_6d = []
+        sample_size = min(len(self.data_triplets), 10000)  # Don't compute all for efficiency
+        
+        for i, (_, p1, p2, p3) in enumerate(random.sample(self.data_triplets, sample_size)):
+            r1 = self.get_rotation_matrix(p1)
+            r2 = self.get_rotation_matrix(p2)
+            r3 = self.get_rotation_matrix(p3)
             
             # Compute relative rotations
-            delta_12 = (r1.inv() * r2).as_matrix().reshape(9)  # More stable: R1^-1 * R2
-            delta_23 = (r2.inv() * r3).as_matrix().reshape(9)  # More stable: R2^-1 * R3
+            delta_12 = np.dot(r2, r1.T)  # R2 * R1^T
+            delta_23 = np.dot(r3, r2.T)  # R3 * R2^T
             
-            all_deltas.extend([delta_12, delta_23])
+            # Convert to 6D (first two columns)
+            delta_12_6d = delta_12[:, :2].reshape(6)
+            delta_23_6d = delta_23[:, :2].reshape(6)
+            
+            all_deltas_6d.extend([delta_12_6d, delta_23_6d])
         
-        self.deltas = np.array(all_deltas)
-        self.mean, self.std = self.deltas.mean(axis=0), self.deltas.std(axis=0) + 1e-8
+        self.deltas_6d = np.array(all_deltas_6d)
+        self.mean = self.deltas_6d.mean(axis=0)
+        self.std = self.deltas_6d.std(axis=0) + 1e-8
         
-        print(f"Delta statistics - Mean: {np.mean(self.mean):.4f}, Std: {np.mean(self.std):.4f}")
+        print(f"6D Delta statistics - Mean range: [{self.mean.min():.4f}, {self.mean.max():.4f}]")
+        print(f"                   - Std range:  [{self.std.min():.4f}, {self.std.max():.4f}]")
         
     def get_quat(self, pt_info): 
         return np.array([pt_info['RotationQuaternion'][k] for k in 'xyzw'])
+    
+    def get_rotation_matrix(self, pt_info):
+        quat = self.get_quat(pt_info)
+        return R.from_quat(quat).as_matrix()
     
     def __len__(self): 
         return len(self.data_triplets)
@@ -146,120 +208,70 @@ class RotationDeltaDataset(Dataset):
         images_dir, p1, p2, p3 = self.data_triplets[idx]
         
         def load_img(pt): 
-            return self.image_processor(cv2.cvtColor(cv2.imread(os.path.join(images_dir, pt['FileName'])), cv2.COLOR_BGR2RGB), return_tensors="pt").pixel_values.squeeze(0)
+            img_path = os.path.join(images_dir, pt['FileName'])
+            img = cv2.imread(img_path)
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            return self.image_processor(img_rgb, return_tensors="pt").pixel_values.squeeze(0)
         
         img1, img2, img3 = load_img(p1), load_img(p2), load_img(p3)
         
-        # Get quaternions
-        q1 = self.get_quat(p1)
-        q2 = self.get_quat(p2)
-        q3 = self.get_quat(p3)
+        # Get rotation matrices
+        r1 = self.get_rotation_matrix(p1)
+        r2 = self.get_rotation_matrix(p2)
+        r3 = self.get_rotation_matrix(p3)
         
-        # Convert to rotations
-        r1 = R.from_quat(q1)
-        r2 = R.from_quat(q2)
-        r3 = R.from_quat(q3)
+        # Compute deltas
+        delta_12 = np.dot(r2, r1.T)
+        delta_23 = np.dot(r3, r2.T)
         
-        # Compute deltas (more stable)
-        delta_12 = (r1.inv() * r2).as_matrix().reshape(9)
-        delta_23 = (r2.inv() * r3).as_matrix().reshape(9)
+        # Convert to 6D representation (first two columns flattened)
+        delta_12_6d = delta_12[:, :2].reshape(6)
+        delta_23_6d = delta_23[:, :2].reshape(6)
         
-        # Normalize deltas
-        delta_12_norm = (delta_12 - self.mean) / self.std
-        delta_23_norm = (delta_23 - self.mean) / self.std
+        # Normalize using dataset statistics
+        delta_12_6d_norm = (delta_12_6d - self.mean) / self.std
+        delta_23_6d_norm = (delta_23_6d - self.mean) / self.std
         
         return (
             img1, 
             img2, 
             img3, 
-            torch.tensor(delta_12_norm).float(), 
-            torch.tensor(delta_23_norm).float()
+            torch.tensor(delta_12_6d_norm).float(), 
+            torch.tensor(delta_23_6d_norm).float()
         )
 
-# --------------- 3. Loss Functions (SAME AS WORKING VERSION) ---------------
-def gram_schmidt_batch(matrices):
-    """Apply Gram-Schmidt orthogonalization to batch of 3x3 matrices."""
-    batch_size = matrices.shape[0]
-    A = matrices.view(batch_size, 3, 3)
-    
-    u1 = A[:, :, 0]
-    e1 = u1 / (torch.norm(u1, dim=1, keepdim=True) + 1e-8)
-    
-    u2 = A[:, :, 1] - torch.sum(e1 * A[:, :, 1], dim=1, keepdim=True) * e1
-    e2 = u2 / (torch.norm(u2, dim=1, keepdim=True) + 1e-8)
-    
-    u3 = A[:, :, 2] - torch.sum(e1 * A[:, :, 2], dim=1, keepdim=True) * e1 - torch.sum(e2 * A[:, :, 2], dim=1, keepdim=True) * e2
-    e3 = u3 / (torch.norm(u3, dim=1, keepdim=True) + 1e-8)
-    
-    Q = torch.stack([e1, e2, e3], dim=2)
-    det = torch.det(Q)
-    Q[det < 0, :, 2] = -Q[det < 0, :, 2]
-    
-    return Q
-
-def nine_d_to_rotmat(nine_d):
-    """Convert 9D representation to rotation matrix using Gram-Schmidt."""
-    batch_size = nine_d.shape[0]
-    nine_d_clamped = torch.clamp(nine_d, -10, 10)
-    rot_matrices = gram_schmidt_batch(nine_d_clamped)
-    return rot_matrices
-
-def angular_distance(pred_9d, target_9d):
-    """Compute angular distance with stable implementation."""
-    pred_rot = nine_d_to_rotmat(pred_9d)
-    target_rot = nine_d_to_rotmat(target_9d)
-    
-    relative = torch.bmm(pred_rot.transpose(1, 2), target_rot)
-    traces = torch.diagonal(relative, dim1=1, dim2=2).sum(dim=1)
-    traces = torch.clamp(traces, -3.0 + 1e-6, 3.0 - 1e-6)
-    
-    cos_angle = (traces - 1) / 2
-    cos_angle = torch.clamp(cos_angle, -1.0 + 1e-7, 1.0 - 1e-7)
-    
-    angles_rad = torch.acos(cos_angle)
-    angles_deg = angles_rad * (180.0 / np.pi)
-    angles_deg = torch.where(torch.isnan(angles_deg), torch.tensor(180.0, device=angles_deg.device), angles_deg)
-    
-    return angles_deg
-
-class RotationLoss(nn.Module):
+# --------------- 3. Loss Function ---------------
+class RotationDelta6DLoss(nn.Module):
     def __init__(self, angular_weight=0.1, l2_reg=1e-4):
         super().__init__()
         self.angular_weight = angular_weight
         self.l2_reg = l2_reg
 
-    def orthogonality_loss(self, nine_d):
-        """Encourage orthogonal matrices."""
-        batch_size = nine_d.shape[0]
-        matrices = nine_d.view(batch_size, 3, 3)
+    def forward(self, pred_6d, target_6d):
+        # Primary MSE loss on 6D representation (this is the key advantage!)
+        mse_loss = torch.mean((pred_6d - target_6d) ** 2)
         
-        AtA = torch.bmm(matrices.transpose(1, 2), matrices)
-        I = torch.eye(3, device=nine_d.device).unsqueeze(0).expand(batch_size, -1, -1)
+        # Angular loss for rotation quality
+        try:
+            angular_errors = angular_distance_6d(pred_6d, target_6d)
+            angular_loss = torch.mean(angular_errors)
+        except:
+            # Fallback if angular computation fails
+            angular_loss = torch.tensor(0.0, device=pred_6d.device)
         
-        ortho_loss = torch.mean(torch.norm(AtA - I, p='fro', dim=(1, 2)) ** 2)
-        return ortho_loss
-
-    def forward(self, pred_9d, target_9d):
-        pred_9d = torch.clamp(pred_9d, -10, 10)
+        # L2 regularization
+        l2_loss = torch.mean(pred_6d ** 2)
         
-        pred_rot = nine_d_to_rotmat(pred_9d)
-        target_rot = nine_d_to_rotmat(target_9d)
-        
-        chordal_loss = torch.mean(torch.norm(pred_rot - target_rot, p='fro', dim=(1, 2)) ** 2)
-        angular_errors = angular_distance(pred_9d, target_9d)
-        angular_loss_term = torch.mean(angular_errors)
-        ortho_loss = self.orthogonality_loss(pred_9d)
-        l2_loss = torch.mean(pred_9d ** 2)
-        
-        total_loss = chordal_loss + self.angular_weight * angular_loss_term + 0.01 * ortho_loss + self.l2_reg * l2_loss
+        # Combined loss (MSE is primary since 6D is continuous)
+        total_loss = mse_loss + self.angular_weight * angular_loss + self.l2_reg * l2_loss
         
         if torch.isnan(total_loss):
-            logging.warning("NaN detected in loss computation. Using MSE fallback.")
-            total_loss = torch.mean((pred_9d - target_9d) ** 2)
+            logging.warning("NaN detected in loss computation. Using MSE only.")
+            total_loss = mse_loss
         
         return total_loss
 
-# --------------- 4. Evaluation (SAME STRUCTURE AS WORKING) ---------------
+# --------------- 4. Evaluation ---------------
 def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
     model.eval()
     total_loss, all_preds, all_labels = 0, [], []
@@ -267,19 +279,19 @@ def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
     
     with torch.no_grad():
         for batch in tqdm(loader, desc='Evaluating', leave=False):
-            img1, img2, img3, delta_12, delta_23_target = [b.to(device) for b in batch]
+            img1, img2, img3, delta_12_6d, delta_23_target_6d = [b.to(device) for b in batch]
             
             try:
-                delta_23_pred = model(img1, img2, img3, delta_12)
-                loss = criterion(delta_23_pred, delta_23_target)
+                delta_23_pred_6d = model(img1, img2, img3, delta_12_6d)
+                loss = criterion(delta_23_pred_6d, delta_23_target_6d)
                 
                 if not torch.isfinite(loss):
                     logging.warning(f"Non-finite loss in validation batch. Skipping.")
                     continue
                     
                 total_loss += loss.item()
-                all_preds.append(delta_23_pred.cpu().numpy())
-                all_labels.append(delta_23_target.cpu().numpy())
+                all_preds.append(delta_23_pred_6d.cpu().numpy())
+                all_labels.append(delta_23_target_6d.cpu().numpy())
                 valid_batches += 1
                 
             except Exception as e:
@@ -294,30 +306,43 @@ def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
     preds_np, labels_np = np.vstack(all_preds), np.vstack(all_labels)
     
     try:
-        ang_errors = angular_distance(torch.tensor(preds_np), torch.tensor(labels_np)).numpy()
+        # Compute angular errors
+        ang_errors = angular_distance_6d(torch.tensor(preds_np), torch.tensor(labels_np)).numpy()
         ang_errors = ang_errors[np.isfinite(ang_errors)]
         
         if len(ang_errors) > 0:
             mean_error = np.mean(ang_errors)
-            logging.info(f"Validation @ Step {step}: Avg Loss={avg_loss:.4f}, Mean Delta Angular Err={mean_error:.2f}°")
-            writer.add_scalar('Loss/val', avg_loss, step)
-            writer.add_scalar('Metrics/mean_delta_angular_error', mean_error, step)
-            writer.add_histogram('Delta_Angular_Errors_val', ang_errors, step)
+            median_error = np.median(ang_errors)
+            logging.info(f"Validation @ Step {step}: Loss={avg_loss:.4f}, Mean Angular Err={mean_error:.2f}°, Median={median_error:.2f}°")
             
-            pdf_path = os.path.join(output_dir, 'plots', f'delta_results_step_{step}.pdf')
+            # Log to tensorboard
+            writer.add_scalar('Loss/val', avg_loss, step)
+            writer.add_scalar('Metrics/mean_6d_delta_angular_error', mean_error, step)
+            writer.add_scalar('Metrics/median_6d_delta_angular_error', median_error, step)
+            writer.add_histogram('6D_Delta_Angular_Errors_val', ang_errors, step)
+            
+            # Generate plot
+            pdf_path = os.path.join(output_dir, 'plots', f'6d_delta_results_step_{step}.pdf')
             os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
             
-            errors_denorm = angular_distance(torch.tensor(preds_np * std + mean), torch.tensor(labels_np * std + mean)).numpy()
+            # Denormalize for plotting
+            preds_denorm = preds_np * std + mean
+            labels_denorm = labels_np * std + mean
+            errors_denorm = angular_distance_6d(
+                torch.tensor(preds_denorm), 
+                torch.tensor(labels_denorm)
+            ).numpy()
             errors_denorm = errors_denorm[np.isfinite(errors_denorm)]
             
             if len(errors_denorm) > 0:
                 with PdfPages(pdf_path) as pdf:
-                    plt.figure()
-                    plt.hist(errors_denorm, bins=50)
-                    plt.title(f'Delta Angular Error @ Step {step} (Mean: {np.mean(errors_denorm):.2f}°)')
+                    plt.figure(figsize=(10, 6))
+                    plt.hist(errors_denorm, bins=50, alpha=0.7, edgecolor='black')
+                    plt.title(f'6D Delta Angular Error @ Step {step}\nMean: {np.mean(errors_denorm):.2f}°, Median: {np.median(errors_denorm):.2f}°')
                     plt.xlabel('Angular Error (degrees)')
                     plt.ylabel('Frequency')
-                    pdf.savefig()
+                    plt.grid(True, alpha=0.3)
+                    pdf.savefig(bbox_inches='tight')
                     plt.close()
         else:
             logging.warning("No valid angular errors computed in validation.")
@@ -325,14 +350,21 @@ def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
     except Exception as e:
         logging.error(f"Error computing validation metrics: {e}")
 
-# --------------- 5. Main Training Loop (EXACT SAME AS WORKING) ---------------
+# --------------- 5. Main Training Loop ---------------
 def main(args):
-    output_dir = f"./rotation_delta_training_runs/{datetime.datetime.now().strftime('%Y%b%d_%H-%M-%S')}"
+    output_dir = f"./rotation_6d_delta_training_runs/{datetime.datetime.now().strftime('%Y%b%d_%H-%M-%S')}"
     os.makedirs(output_dir, exist_ok=True)
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s',
-                        handlers=[logging.FileHandler(os.path.join(output_dir, 'train.log')), logging.StreamHandler()])
-    logging.info(f"Starting delta rotation training. Outputting to {output_dir}\nArgs: {args}")
+    
+    # Setup logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+                        handlers=[logging.FileHandler(os.path.join(output_dir, 'train.log')), 
+                                 logging.StreamHandler()])
+    
+    logging.info(f"Starting 6D delta rotation training")
+    logging.info(f"Output directory: {output_dir}")
+    logging.info(f"Arguments: {args}")
 
+    # Load data directories
     train_dirs = [os.path.join(args.data_root, 'train', d) for d in os.listdir(os.path.join(args.data_root, 'train'))]
     val_dirs = [os.path.join(args.data_root, 'val', d) for d in os.listdir(os.path.join(args.data_root, 'val'))]
     
@@ -340,32 +372,41 @@ def main(args):
         logging.warning("--- RUNNING IN SINGLE PATIENT MODE FOR DEBUGGING ---")
         train_dirs, val_dirs = train_dirs[:1], val_dirs[:1]
 
-    train_dataset = RotationDeltaDataset(train_dirs, args.pairs_per_patient)
-    val_dataset = RotationDeltaDataset(val_dirs, args.val_pairs)
+    logging.info(f"Found {len(train_dirs)} training patients, {len(val_dirs)} validation patients")
+
+    # Create datasets
+    train_dataset = RotationDelta6DDataset(train_dirs, args.pairs_per_patient)
+    val_dataset = RotationDelta6DDataset(val_dirs, args.val_pairs)
+    
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = DinoV2RotationDeltaTransformer().to(device)
+    logging.info(f"Training dataset: {len(train_dataset)} samples")
+    logging.info(f"Validation dataset: {len(val_dataset)} samples")
+
+    # Create model
+    model = DinoV2RotationDelta6D().to(device)
     model.encoder.gradient_checkpointing_enable()
 
-    # EXACT SAME OPTIMIZER SETUP AS WORKING VERSION
+    # Setup optimizer (same as working version)
     param_groups = [
         {'params': model.encoder.parameters(), 'lr': args.lr_backbone, 'weight_decay': 1e-5},
         {'params': [p for n, p in model.named_parameters() if not n.startswith('encoder.')], 'lr': args.lr_head, 'weight_decay': 1e-4}
     ]
     optimizer = optim.AdamW(param_groups, eps=1e-8)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.total_steps, eta_min=1e-7)
-    criterion = RotationLoss()
+    criterion = RotationDelta6DLoss()
     scaler = amp.GradScaler(init_scale=512.0)
     writer = SummaryWriter(log_dir=os.path.join(output_dir, 'tensorboard'))
 
-    # Run initial validation before training
+    # Run initial validation
     logging.info("Running initial validation...")
     eval_epoch(model, val_loader, criterion, writer, 0, val_dataset.mean, val_dataset.std, output_dir)
     torch.save(model.state_dict(), os.path.join(output_dir, f'checkpoint_step_0.pth'))
 
+    # Training loop
     train_iter = iter(train_loader)
-    pbar = tqdm(range(1, args.total_steps + 1), desc="Training Delta Model")
+    pbar = tqdm(range(1, args.total_steps + 1), desc="Training 6D Delta Model")
     
     # EMA for smooth loss display
     ema_loss = None
@@ -380,15 +421,15 @@ def main(args):
             train_iter = iter(train_loader)
             batch = next(train_iter)
             
-        img1, img2, img3, delta_12, delta_23_target = [b.to(device) for b in batch]
+        img1, img2, img3, delta_12_6d, delta_23_target_6d = [b.to(device) for b in batch]
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
         
         try:
             with amp.autocast(device_type='cuda'):
-                delta_23_pred = model(img1, img2, img3, delta_12)
-                loss = criterion(delta_23_pred, delta_23_target)
+                delta_23_pred_6d = model(img1, img2, img3, delta_12_6d)
+                loss = criterion(delta_23_pred_6d, delta_23_target_6d)
             
             raw_loss = loss.item()
             
@@ -404,16 +445,15 @@ def main(args):
             else:
                 consecutive_nan_count = 0
             
-            # Backward pass with gradient scaling
+            # Backward pass
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             
-            # SAME gradient clipping as working version
+            # Gradient clipping
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             
-            # Only warn about truly excessive gradients
-            if grad_norm > 2000.0:
-                logging.warning(f"Very large gradient norm: {grad_norm:.2f} at step {step}")
+            if grad_norm > 1000.0:
+                logging.warning(f"Large gradient norm: {grad_norm:.2f} at step {step}")
             
             scaler.step(optimizer)
             scaler.update()
@@ -427,16 +467,15 @@ def main(args):
             
             pbar.set_postfix(smooth_loss=f"{ema_loss:.4f}", grad_norm=f"{grad_norm:.2f}")
             
-            # ENSURE TENSORBOARD LOGGING
-            writer.add_scalar('Loss/train', raw_loss, step)
-            writer.add_scalar('Metrics/grad_norm', grad_norm, step)
-            writer.add_scalar('LR/head', optimizer.param_groups[1]['lr'], step)
-            writer.add_scalar('LR/backbone', optimizer.param_groups[0]['lr'], step)
-            
-            # Also log EMA loss
-            writer.add_scalar('Loss/train_ema', ema_loss, step)
+            # Log metrics
+            if step % 10 == 0:  # Log every 10 steps to reduce overhead
+                writer.add_scalar('Loss/train', raw_loss, step)
+                writer.add_scalar('Metrics/grad_norm', grad_norm, step)
+                writer.add_scalar('LR/head', optimizer.param_groups[1]['lr'], step)
+                writer.add_scalar('LR/backbone', optimizer.param_groups[0]['lr'], step)
+                writer.add_scalar('Loss/train_ema', ema_loss, step)
 
-            # Validation timing SAME AS WORKING
+            # Validation
             if step % args.val_freq == 0 or step == args.total_steps:
                 logging.info(f"Running validation at step {step}...")
                 eval_epoch(model, val_loader, criterion, writer, step, val_dataset.mean, val_dataset.std, output_dir)
@@ -452,10 +491,10 @@ def main(args):
 
     pbar.close()
     writer.close()
-    logging.info("Delta rotation training finished.")
+    logging.info("6D delta rotation training finished.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a DinoV2-based Rotation Delta Transformer.")
+    parser = argparse.ArgumentParser(description="Train a DinoV2-based 6D Rotation Delta Transformer.")
     parser.add_argument('--data_root', type=str, default='../ct_data_rotation_only')
     parser.add_argument('--lr_head', type=float, default=1e-5, help='Peak learning rate for the new layers.')
     parser.add_argument('--lr_backbone', type=float, default=1e-6, help='Peak learning rate for the backbone.')
