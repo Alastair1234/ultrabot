@@ -6,7 +6,7 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 class DinoV2RotationTransformer(nn.Module):
     def __init__(self, embed_dim=384, num_heads=6, depth=3, mlp_ratio=4, rot_dim=9):  # rot_dim=9 for single rotation (we'll use twice)
         super().__init__()
-        self.encoder = timm.create_model('facebook/dinov2-base', pretrained=True, num_classes=0)
+        self.encoder = timm.create_model('vit_small_patch16_224.dino', pretrained=True, num_classes=0)
         encoder_dim = self.encoder.embed_dim
         
         # New: Embedders for rotations (project 9D rotation to match encoder_dim)
