@@ -1,8 +1,7 @@
 # ==============================================================================
-# File: model_rotation_stable_val_fixed.py
+# File: model_rotation_stable_val_fixed_DELTAS.py
 #
-# Description:
-# Back to the working stable version, just fixing validation timing
+# Modified to predict rotation deltas instead of absolute rotations
 # ==============================================================================
 
 import os
@@ -27,7 +26,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# --------------- 1. The Model Definition (BACK TO WORKING VERSION) ---------------
+# --------------- 1. The Model Definition (Modified for delta input) ---------------
 class DinoV2RotationTransformer(nn.Module):
     def __init__(self, embed_dim=384, num_heads=6, depth=3, mlp_ratio=4, rot_dim=9):
         super().__init__()
@@ -37,7 +36,7 @@ class DinoV2RotationTransformer(nn.Module):
         # Add dropout for regularization
         self.dropout = nn.Dropout(0.1)
         
-        # Better initialization for rotation embedder
+        # Better initialization for rotation embedder - now for delta rotation
         self.rot_embedder = nn.Linear(rot_dim, encoder_dim)
         nn.init.xavier_uniform_(self.rot_embedder.weight, gain=0.1)
         nn.init.zeros_(self.rot_embedder.bias)
@@ -61,24 +60,21 @@ class DinoV2RotationTransformer(nn.Module):
         nn.init.xavier_uniform_(self.regressor.weight, gain=0.01)  # Much smaller gain
         nn.init.zeros_(self.regressor.bias)
 
-    def forward(self, img1, img2, img3, input_abs):
+    def forward(self, img1, img2, img3, input_delta):
         # Get features and apply layer norm to prevent explosion
         feat1 = self.layer_norm1(self.encoder(img1).last_hidden_state[:, 0])
         feat2 = self.layer_norm1(self.encoder(img2).last_hidden_state[:, 0])
         feat3 = self.layer_norm1(self.encoder(img3).last_hidden_state[:, 0])
         
-        # Split and constrain input rotations
-        abs_p1, abs_p2 = input_abs[:, :9], input_abs[:, 9:]
-        abs_p1 = torch.clamp(abs_p1, -10, 10)  # Prevent extreme inputs
-        abs_p2 = torch.clamp(abs_p2, -10, 10)
+        # Input is delta (img1→img2)
+        delta_12 = torch.clamp(input_delta, -10, 10)  # Prevent extreme inputs
         
-        # Embed rotations with normalization
-        rot_emb1 = self.layer_norm2(self.rot_embedder(abs_p1))
-        rot_emb2 = self.layer_norm2(self.rot_embedder(abs_p2))
+        # Embed rotation delta with normalization
+        rot_emb_delta = self.layer_norm2(self.rot_embedder(delta_12))
         
-        # Fuse features
-        fused_feat1 = feat1 + rot_emb1
-        fused_feat2 = feat2 + rot_emb2
+        # Fuse features - combine delta with img2 since we're predicting from img2→img3
+        fused_feat1 = feat1
+        fused_feat2 = feat2 + rot_emb_delta  # Add delta info to img2
         
         # Apply dropout
         fused_feat1 = self.dropout(fused_feat1)
@@ -102,7 +98,7 @@ class DinoV2RotationTransformer(nn.Module):
         
         return output
 
-# --------------- 2. Dataset and Preprocessing (Same as working) ---------------
+# --------------- 2. Dataset and Preprocessing (Modified for deltas) ---------------
 class RotationDataset(Dataset):
     def __init__(self, patient_dirs, pairs_per_patient=1000):
         self.image_processor = AutoImageProcessor.from_pretrained('facebook/dinov2-small')
@@ -114,21 +110,58 @@ class RotationDataset(Dataset):
             with open(info_path) as f: points = json.load(f)['PointInfos']
             if len(points) < 3: continue
             for _ in range(pairs_per_patient): self.data_triplets.append((images_dir, *random.sample(points, 3)))
-        all_quats = [self.get_quat(p) for _, p1, p2, p3 in self.data_triplets for p in [p1, p2, p3]]
-        self.absolutes = np.array([self.quat_to_9d(q) for q in all_quats])
-        self.mean, self.std = self.absolutes.mean(axis=0), self.absolutes.std(axis=0) + 1e-8
-    def get_quat(self, pt_info): return np.array([pt_info['RotationQuaternion'][k] for k in 'xyzw'])
-    def quat_to_9d(self, quat): return R.from_quat(quat).as_matrix().reshape(9)
-    def __len__(self): return len(self.data_triplets)
+        
+        # Compute all deltas for normalization
+        all_deltas = []
+        for _, p1, p2, p3 in self.data_triplets:
+            delta_12 = self.compute_rotation_delta(self.get_quat(p1), self.get_quat(p2))
+            delta_23 = self.compute_rotation_delta(self.get_quat(p2), self.get_quat(p3))
+            all_deltas.extend([delta_12, delta_23])
+        
+        self.deltas = np.array(all_deltas)
+        self.mean, self.std = self.deltas.mean(axis=0), self.deltas.std(axis=0) + 1e-8
+        
+    def get_quat(self, pt_info): 
+        return np.array([pt_info['RotationQuaternion'][k] for k in 'xyzw'])
+    
+    def quat_to_9d(self, quat): 
+        return R.from_quat(quat).as_matrix().reshape(9)
+    
+    def compute_rotation_delta(self, quat1, quat2):
+        """Compute rotation delta from quat1 to quat2"""
+        r1 = R.from_quat(quat1)
+        r2 = R.from_quat(quat2)
+        # Delta rotation: R_delta = R1^T * R2
+        r_delta = r1.inv() * r2
+        return r_delta.as_matrix().reshape(9)
+    
+    def __len__(self): 
+        return len(self.data_triplets)
+    
     def __getitem__(self, idx):
         images_dir, p1, p2, p3 = self.data_triplets[idx]
-        def load_img(pt): return self.image_processor(cv2.cvtColor(cv2.imread(os.path.join(images_dir, pt['FileName'])), cv2.COLOR_BGR2RGB), return_tensors="pt").pixel_values.squeeze(0)
+        
+        def load_img(pt): 
+            return self.image_processor(
+                cv2.cvtColor(cv2.imread(os.path.join(images_dir, pt['FileName'])), cv2.COLOR_BGR2RGB), 
+                return_tensors="pt"
+            ).pixel_values.squeeze(0)
+        
         img1, img2, img3 = load_img(p1), load_img(p2), load_img(p3)
-        abs_p1, abs_p2, abs_p3_label = [(self.quat_to_9d(self.get_quat(p)) - self.mean) / self.std for p in (p1, p2, p3)]
-        input_abs = np.concatenate([abs_p1, abs_p2])
-        return (img1, img2, img3, torch.tensor(input_abs).float(), torch.tensor(abs_p3_label).float())
+        
+        # Compute deltas
+        delta_12 = self.compute_rotation_delta(self.get_quat(p1), self.get_quat(p2))
+        delta_23 = self.compute_rotation_delta(self.get_quat(p2), self.get_quat(p3))
+        
+        # Normalize deltas
+        delta_12_norm = (delta_12 - self.mean) / self.std
+        delta_23_label = (delta_23 - self.mean) / self.std
+        
+        return (img1, img2, img3, 
+                torch.tensor(delta_12_norm).float(), 
+                torch.tensor(delta_23_label).float())
 
-# --------------- 3. Loss Function and Metrics (Same as working) ---------------
+# --------------- 3. Loss Function and Metrics (Same as before) ---------------
 def gram_schmidt_batch(matrices):
     """Apply Gram-Schmidt orthogonalization to batch of 3x3 matrices."""
     batch_size = matrices.shape[0]
@@ -239,7 +272,7 @@ class RotationLoss(nn.Module):
         
         return total_loss
 
-# --------------- 4. Evaluation and Plotting (Same as working) ---------------
+# --------------- 4. Evaluation and Plotting (Updated for deltas) ---------------
 def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
     model.eval()
     total_loss, all_preds, all_labels = 0, [], []
@@ -247,11 +280,11 @@ def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
     
     with torch.no_grad():
         for batch in tqdm(loader, desc='Evaluating', leave=False):
-            img1, img2, img3, input_abs, abs_p3 = [b.to(device) for b in batch]
+            img1, img2, img3, input_delta, delta_23 = [b.to(device) for b in batch]
             
             try:
-                output = model(img1, img2, img3, input_abs)
-                loss = criterion(output, abs_p3)
+                output = model(img1, img2, img3, input_delta)
+                loss = criterion(output, delta_23)
                 
                 # Skip batch if loss is not finite
                 if not torch.isfinite(loss):
@@ -260,7 +293,7 @@ def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
                     
                 total_loss += loss.item()
                 all_preds.append(output.cpu().numpy())
-                all_labels.append(abs_p3.cpu().numpy())
+                all_labels.append(delta_23.cpu().numpy())
                 valid_batches += 1
                 
             except Exception as e:
@@ -296,7 +329,7 @@ def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
                 with PdfPages(pdf_path) as pdf:
                     plt.figure()
                     plt.hist(errors_denorm, bins=50)
-                    plt.title(f'Angular Error @ Step {step} (Mean: {np.mean(errors_denorm):.2f})')
+                    plt.title(f'Angular Error (Delta) @ Step {step} (Mean: {np.mean(errors_denorm):.2f})')
                     pdf.savefig()
                     plt.close()
         else:
@@ -305,13 +338,13 @@ def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
     except Exception as e:
         logging.error(f"Error computing validation metrics: {e}")
 
-# --------------- 5. Main Training Loop (FIXED VALIDATION TIMING ONLY) ---------------
+# --------------- 5. Main Training Loop (Updated for deltas) ---------------
 def main(args):
-    output_dir = f"./rotation_training_runs/{datetime.datetime.now().strftime('%Y%b%d_%H-%M-%S')}"
+    output_dir = f"./rotation_training_runs/{datetime.datetime.now().strftime('%Y%b%d_%H-%M-%S')}_DELTAS"
     os.makedirs(output_dir, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s',
                         handlers=[logging.FileHandler(os.path.join(output_dir, 'train.log')), logging.StreamHandler()])
-    logging.info(f"Starting run. Outputting to {output_dir}\nArgs: {args}")
+    logging.info(f"Starting run (DELTA MODE). Outputting to {output_dir}\nArgs: {args}")
 
     train_dirs = [os.path.join(args.data_root, 'train', d) for d in os.listdir(os.path.join(args.data_root, 'train'))]
     val_dirs = [os.path.join(args.data_root, 'val', d) for d in os.listdir(os.path.join(args.data_root, 'val'))]
@@ -359,15 +392,15 @@ def main(args):
             train_iter = iter(train_loader)
             batch = next(train_iter)
             
-        img1, img2, img3, input_abs, abs_p3 = [b.to(device) for b in batch]
+        img1, img2, img3, input_delta, delta_23 = [b.to(device) for b in batch]
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
         
         try:
             with amp.autocast(device_type='cuda'):
-                outputs = model(img1, img2, img3, input_abs)
-                loss = criterion(outputs, abs_p3)
+                outputs = model(img1, img2, img3, input_delta)
+                loss = criterion(outputs, delta_23)
             
             raw_loss = loss.item()
             
@@ -433,13 +466,13 @@ def main(args):
     logging.info("Training finished.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a DinoV2-based Rotation Transformer.")
+    parser = argparse.ArgumentParser(description="Train a DinoV2-based Rotation Transformer (Delta Mode).")
     parser.add_argument('--data_root', type=str, default='../ct_data_rotation_only')
-    parser.add_argument('--lr_head', type=float, default=1e-5, help='Peak learning rate for the new layers.')  # Back to working LRs
+    parser.add_argument('--lr_head', type=float, default=1e-5, help='Peak learning rate for the new layers.')
     parser.add_argument('--lr_backbone', type=float, default=1e-6, help='Peak learning rate for the backbone.')
-    parser.add_argument('--batch_size', type=int, default=32)  # Back to working batch size
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--total_steps', type=int, default=20000)
-    parser.add_argument('--val_freq', type=int, default=1000)  # Back to 1000
+    parser.add_argument('--val_freq', type=int, default=1000)
     parser.add_argument('--pairs_per_patient', type=int, default=1000)
     parser.add_argument('--val_pairs', type=int, default=200)
     parser.add_argument('--single_patient', action='store_true', help='Debug with one patient.')
