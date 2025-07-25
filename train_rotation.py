@@ -1,11 +1,10 @@
-
 # ==============================================================================
-# File: model_rotation_final.py
+# File: model_rotation_final_v2.py
 #
 # Description:
 # A streamlined script to train a transformer model to predict 3D rotation.
-# This version includes the critical fix for using torch.linalg.svd inside an
-# amp.autocast context, which is required for mixed-precision training.
+# This version includes the definitive fixes for both torch.linalg.svd and
+# torch.det which do not support float16 inputs inside an amp.autocast context.
 # ==============================================================================
 
 import os
@@ -51,17 +50,14 @@ class DinoV2RotationTransformer(nn.Module):
         self.regressor = nn.Linear(embed_dim, 9)
 
     def forward(self, img1, img2, img3, input_abs):
-        # Extract image features using the [CLS] token embedding
         feat1 = self.encoder(img1).last_hidden_state[:, 0]
         feat2 = self.encoder(img2).last_hidden_state[:, 0]
         feat3 = self.encoder(img3).last_hidden_state[:, 0]
 
-        # Embed and fuse rotation info with image features
         abs_p1, abs_p2 = input_abs[:, :9], input_abs[:, 9:]
         fused_feat1 = feat1 + self.rot_embedder(abs_p1)
         fused_feat2 = feat2 + self.rot_embedder(abs_p2)
 
-        # Process the combined features through the transformer
         combined = torch.cat([fused_feat1, fused_feat2, feat3], dim=1)
         projected = self.projector(combined).unsqueeze(1)
         transformer_out = self.transformer(projected).squeeze(1)
@@ -104,32 +100,30 @@ class RotationDataset(Dataset):
         abs_p2 = (self.quat_to_9d(self.get_quat(p2)) - self.mean) / self.std
         abs_p3_label = (self.quat_to_9d(self.get_quat(p3)) - self.mean) / self.std
         input_abs = np.concatenate([abs_p1, abs_p2])
-
         return (img1, img2, img3, torch.tensor(input_abs).float(), torch.tensor(abs_p3_label).float())
 
 # --------------- 3. Loss Function and Metrics ---------------
 
 def nine_d_to_rotmat(nine_d):
-    """(CORRECTED) Converts a 9D vector back to a 3x3 rotation matrix using SVD."""
+    """(DEFINITIVELY CORRECTED) Converts a 9D vector to a 3x3 rotation matrix."""
     b, _ = nine_d.shape
-    ## --- FIX ---
-    # The SVD operation on GPU does not support float16 (half) tensors.
-    # We must cast the input to float32 before calling torch.linalg.svd.
+    # FIX 1: Cast to float32 for SVD, which doesn't support float16
     mats = nine_d.view(b, 3, 3).to(torch.float32)
-    
     U, _, Vt = torch.linalg.svd(mats)
-    det = torch.det(U @ Vt)
+    
+    # FIX 2: Cast the result to float32 for det, which also doesn't support float16
+    rotation_matrix = U @ Vt
+    det = torch.det(rotation_matrix.to(torch.float32))
+
+    # This part is fine. `Vt_clone` is float16 (if in autocast) but the indexing is fine.
     Vt_clone = Vt.clone()
     Vt_clone[det < 0, 2, :] = -Vt_clone[det < 0, 2, :]
     return U @ Vt_clone
 
 def angular_distance(pred_9d, target_9d):
-    """(CORRECTED) Calculates the angular distance (in degrees), keeping tensors on the GPU."""
-    ## --- FIX ---
-    # The .cpu() calls were removed for efficiency. The calculation now stays on the GPU.
+    """Calculates the angular distance (in degrees), keeping tensors on the GPU."""
     pred_rot = nine_d_to_rotmat(pred_9d)
     target_rot = nine_d_to_rotmat(target_9d)
-    
     relative = torch.bmm(pred_rot.transpose(1, 2), target_rot)
     traces = torch.einsum('bii->b', relative)
     return torch.acos(torch.clamp((traces - 1) / 2, -1.0 + 1e-7, 1.0 - 1e-7)) * (180.0 / np.pi)
@@ -153,7 +147,7 @@ def eval_epoch(model, loader, criterion, writer, step, mean, std, output_dir):
     total_loss, all_preds, all_labels = 0, [], []
     with torch.no_grad():
         for img1, img2, img3, input_abs, abs_p3 in tqdm(loader, desc='Evaluating', leave=False):
-            img1, img2, img3, input_abs, abs_p3 = img1.to(device), img2.to(device), img3.to(device), input_abs.to(device), abs_p3.to(device)
+            img1, img2, img3, input_abs, abs_p3 = [b.to(device) for b in (img1, img2, img3, input_abs, abs_p3)]
             with amp.autocast(device_type='cuda'):
                 output = model(img1, img2, img3, input_abs)
                 loss = criterion(output, abs_p3)
