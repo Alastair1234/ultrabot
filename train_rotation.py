@@ -8,18 +8,57 @@ import datetime
 from torch.utils.data import Dataset, DataLoader
 from torch import nn, optim, amp
 from tqdm import tqdm
-from model_rotation_only import DinoV2RotationTransformer  # Import from the model file
 from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import argparse
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 import logging
 from logging.handlers import RotatingFileHandler
 import time
+import timm
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+class DinoV2RotationTransformer(nn.Module):
+    def __init__(self, embed_dim=384, num_heads=6, depth=3, mlp_ratio=4, rot_dim=9):
+        super().__init__()
+        self.encoder = timm.create_model('facebook/dinov2-base', pretrained=True, num_classes=0)
+        encoder_dim = self.encoder.embed_dim
+        
+        # Embedder for rotations (project 9D to encoder_dim)
+        self.rot_embedder = nn.Linear(rot_dim, encoder_dim)
+        
+        # Projector for concatenated fused features
+        self.projector = nn.Linear(encoder_dim * 3, embed_dim)
+        
+        layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=int(mlp_ratio * embed_dim), activation='gelu')
+        self.transformer = nn.TransformerEncoder(layer, num_layers=depth)
+        self.regressor = nn.Linear(embed_dim, 9)  # Output 9D absolute for p3
+
+    def forward(self, img1, img2, img3, input_abs):
+        # Split input_abs into abs_p1 (first 9) and abs_p2 (next 9)
+        abs_p1 = input_abs[:, :9]  # (B, 9)
+        abs_p2 = input_abs[:, 9:]  # (B, 9)
+        
+        # Extract image features
+        feat1 = self.encoder(img1)  # (B, encoder_dim)
+        feat2 = self.encoder(img2)
+        feat3 = self.encoder(img3)
+        
+        # Early fusion: Embed rotations and add to their image features
+        embedded_p1 = self.rot_embedder(abs_p1)  # (B, encoder_dim)
+        embedded_p2 = self.rot_embedder(abs_p2)
+        fused_feat1 = feat1 + embedded_p1
+        fused_feat2 = feat2 + embedded_p2
+        # feat3 has no rotation (predicting it), so leave as-is
+        
+        # Concatenate fused features
+        combined = torch.cat([fused_feat1, fused_feat2, feat3], dim=1)  # (B, 3*encoder_dim)
+        
+        projected = self.projector(combined).unsqueeze(0)  # (1, B, embed_dim)
+        transformer_out = self.transformer(projected).squeeze(0)
+        return self.regressor(transformer_out)
 
 class RotationDataset(Dataset):
     def __init__(self, patient_dirs, pairs_per_patient=2000):
@@ -37,27 +76,22 @@ class RotationDataset(Dataset):
                 p1, p2, p3 = random.sample(points, 3)
                 self.data_triplets.append((images_dir, p1, p2, p3))
 
-        self.labels = np.array([self.calc_label(p2, p3) for _, _, p2, p3 in self.data_triplets])
-        self.mean = self.labels.mean(axis=0)
-        self.std = self.labels.std(axis=0) + 1e-8
+        # Compute absolute 9D for all
+        self.absolutes = np.array([self.quat_to_9d(self.get_quat(p)) for _, p1, p2, p3 in self.data_triplets for p in [p1, p2, p3]]).reshape(-1, 3, 9)
+        self.mean = self.absolutes.mean(axis=(0,1))
+        self.std = self.absolutes.std(axis=(0,1)) + 1e-8
         
-        # Log data stats (using global logger if available, else print)
-        try:
-            logger = logging.getLogger('rotation_training')
-            angles = [np.linalg.norm(label) for label in self.labels]  # Rough magnitude
-            logger.info(f"Dataset stats: Samples={len(self)}, Mean label norm={np.mean(angles):.4f}, Std={np.std(angles):.4f}, Min/Max={np.min(angles):.4f}/{np.max(angles):.4f}")
-            logger.info(f"Label mean={self.mean.tolist()}, std={self.std.tolist()}")
-        except:
-            print("Logger not initialized yet for dataset stats.")
+        # Log data stats
+        logger = logging.getLogger('rotation_training')
+        norms = np.linalg.norm(self.absolutes.reshape(-1, 9), axis=1)
+        logger.info(f"Dataset stats (absolutes): Samples={len(self)}, Mean norm={np.mean(norms):.4f}, Std={np.std(norms):.4f}, Min/Max={np.min(norms):.4f}/{np.max(norms):.4f}")
+        logger.info(f"Absolute mean={self.mean.tolist()}, std={self.std.tolist()}")
+
+    def get_quat(self, pt):
+        return np.array([pt['RotationQuaternion'][k] for k in 'xyzw'])
 
     def quat_to_9d(self, quat):
         return R.from_quat(quat).as_matrix().reshape(9)
-
-    def calc_label(self, p1, p2):
-        q1 = np.array([p1['RotationQuaternion'][k] for k in 'xyzw'])
-        q2 = np.array([p2['RotationQuaternion'][k] for k in 'xyzw'])
-        quat_diff = (R.from_quat(q2) * R.from_quat(q1).inv()).as_quat()
-        return self.quat_to_9d(quat_diff)
 
     def __len__(self):
         return len(self.data_triplets)
@@ -71,19 +105,24 @@ class RotationDataset(Dataset):
             return torch.tensor(img).permute(2, 0, 1).float()
 
         img1, img2, img3 = load_img(p1), load_img(p2), load_img(p3)
-        delta_p1_p2 = (self.calc_label(p1, p2) - self.mean) / self.std
-        label_p2_p3 = (self.calc_label(p2, p3) - self.mean) / self.std
-        return img1, img2, img3, torch.tensor(delta_p1_p2).float(), torch.tensor(label_p2_p3).float()
+        
+        # Absolutes (normalized)
+        abs_p1 = (self.quat_to_9d(self.get_quat(p1)) - self.mean) / self.std
+        abs_p2 = (self.quat_to_9d(self.get_quat(p2)) - self.mean) / self.std
+        abs_p3 = (self.quat_to_9d(self.get_quat(p3)) - self.mean) / self.std
+        
+        # Input: Concat abs_p1 and abs_p2 (18D)
+        input_abs = np.concatenate([abs_p1, abs_p2])
+        
+        return img1, img2, img3, torch.tensor(input_abs).float(), torch.tensor(abs_p3).float()
 
 def nine_d_to_rotmat(nine_d):
     if isinstance(nine_d, np.ndarray):
         nine_d = torch.from_numpy(nine_d).float()
     
-    # Explicitly cast to fp32 to avoid fp16 errors in SVD/det
     nine_d = nine_d.to(torch.float32)
-    
     batch_size = nine_d.shape[0]
-    mats = nine_d.reshape(batch_size, 3, 3).to(torch.float32)  # Ensure reshape is in fp32
+    mats = nine_d.reshape(batch_size, 3, 3).to(torch.float32)
     u, s, vt = torch.linalg.svd(mats)
     ortho_mats = torch.bmm(u, vt)
     dets = torch.det(ortho_mats)
@@ -94,7 +133,6 @@ def nine_d_to_rotmat(nine_d):
     return torch.bmm(u_clone, vt)
 
 def angular_distance(pred_9d, target_9d):
-    # Explicitly cast to fp32 to avoid fp16 errors
     pred_9d = pred_9d.to(torch.float32)
     target_9d = target_9d.to(torch.float32)
     
@@ -110,12 +148,11 @@ class RotationLoss(nn.Module):
         self.angular_weight = angular_weight
 
     def forward(self, pred, target):
-        # Cast inputs to fp32 here as well for safety
         pred = pred.to(torch.float32)
         target = target.to(torch.float32)
         
         pred_rot = nine_d_to_rotmat(pred)
-        target_rot = nine_d_to_rotmat(target)  # Target is already orthogonal
+        target_rot = nine_d_to_rotmat(target)
         chordal_loss = torch.mean(torch.norm(pred_rot - target_rot, p='fro', dim=(1,2)) ** 2)
         angular_loss = torch.mean(angular_distance(pred, target))
         return chordal_loss + self.angular_weight * angular_loss
@@ -140,24 +177,22 @@ def plot_results(preds, labels, step, save_dir, mean, std):
 def eval_epoch(model, loader, criterion, writer, global_step, dataset_mean, dataset_std):
     model.eval()
     total_loss = 0
-    preds, labels_list, deltas_list = [], [], []  # Collect deltas for logging
+    preds, labels_list, inputs_list = [], [], []  # Collect inputs for logging
     with torch.no_grad():
-        for img1, img2, img3, delta_p1_p2, labels in tqdm(loader, desc='Evaluating'):
-            img1, img2, img3, delta_p1_p2, labels = img1.to(device), img2.to(device), img3.to(device), delta_p1_p2.to(device), labels.to(device)
-            with amp.autocast(device_type='cuda'):  # Keep for model forward (efficient)
-                output = model(img1, img2, img3, delta_p1_p2)
-            loss = criterion(output, labels)  # Compute loss OUTSIDE autocast for fp32 safety
+        for img1, img2, img3, input_abs, abs_p3 in tqdm(loader, desc='Evaluating'):
+            img1, img2, img3, input_abs, abs_p3 = img1.to(device), img2.to(device), img3.to(device), input_abs.to(device), abs_p3.to(device)
+            with amp.autocast(device_type='cuda'):
+                output = model(img1, img2, img3, input_abs)
+            loss = criterion(output, abs_p3)
             total_loss += loss.item()
             preds.append(output.cpu().numpy())
-            labels_list.append(labels.cpu().numpy())
-            deltas_list.append(delta_p1_p2.cpu().numpy())  # Collect deltas
+            labels_list.append(abs_p3.cpu().numpy())
+            inputs_list.append(input_abs.cpu().numpy())
 
-    # Stack collected data
     preds = np.vstack(preds)
     labels_list = np.vstack(labels_list)
-    deltas_list = np.vstack(deltas_list)
+    inputs_list = np.vstack(inputs_list)
     
-    # Calculate detailed metrics
     preds_t = torch.tensor(preds)
     labels_t = torch.tensor(labels_list)
     ang_errors = angular_distance(preds_t, labels_t).numpy()
@@ -165,49 +200,41 @@ def eval_epoch(model, loader, criterion, writer, global_step, dataset_mean, data
     median_ang = np.median(ang_errors)
     percent_under_5 = np.mean(ang_errors < 5) * 100
     
-    # Log to file
     logger = logging.getLogger('rotation_training')
     logger.info(f"Validation at step {global_step}: Loss={total_loss / len(loader):.4f}, Mean Angular Error={mean_ang:.4f} deg, Median={median_ang:.4f} deg, % <5 deg={percent_under_5:.2f}")
     logger.info(f"Angular Error Stats: Min={np.min(ang_errors):.4f}, Max={np.max(ang_errors):.4f}, Std={np.std(ang_errors):.4f}")
     
-    # Log to TensorBoard
     writer.add_scalar('Loss/val', total_loss / len(loader), global_step)
     writer.add_scalar('Error/mean_angular_val', mean_ang, global_step)
     writer.add_scalar('Error/median_angular_val', median_ang, global_step)
     writer.add_scalar('Error/percent_under_5', percent_under_5, global_step)
     writer.add_histogram('Angular_Errors', ang_errors, global_step)
     
-    # Log 3 individual examples for debugging (random samples)
-    num_samples = min(3, len(preds))  # Up to 3
+    num_samples = min(3, len(preds))
     sample_indices = random.sample(range(len(preds)), num_samples)
     for i, idx in enumerate(sample_indices):
-        sample_delta = deltas_list[idx][:3]  # First 3 elements for brevity
+        sample_input = inputs_list[idx][:6]  # First 6 for brevity (of 18D)
         sample_pred = preds[idx][:3]
         sample_label = labels_list[idx][:3]
         sample_ang_error = ang_errors[idx]
         
-        # Per-sample chordal loss (for debug)
         sample_pred_t = torch.tensor(preds[idx]).unsqueeze(0)
         sample_label_t = torch.tensor(labels_list[idx]).unsqueeze(0)
         sample_chordal = torch.norm(nine_d_to_rotmat(sample_pred_t) - nine_d_to_rotmat(sample_label_t), p='fro', dim=(1,2)).item() ** 2
         
-        # Log to file
-        logger.info(f"Val Sample {i+1} (idx {idx}): Delta_p1_p2={sample_delta.tolist()}, Pred={sample_pred.tolist()}, Label={sample_label.tolist()}, Angular Error={sample_ang_error:.4f} deg, Chordal Loss={sample_chordal:.4f}")
+        logger.info(f"Val Sample {i+1} (idx {idx}): Input_Abs_p1_p2={sample_input.tolist()}, Pred={sample_pred.tolist()}, Label={sample_label.tolist()}, Angular Error={sample_ang_error:.4f} deg, Chordal Loss={sample_chordal:.4f}")
         
-        # Log to TensorBoard (text for details, scalars for metrics)
-        text_str = f"Sample {i+1}: Delta_p1_p2={sample_delta}, Pred={sample_pred}, Label={sample_label}, Angular Error={sample_ang_error:.4f} deg, Chordal Loss={sample_chordal:.4f}"
+        text_str = f"Sample {i+1}: Input_Abs_p1_p2={sample_input}, Pred={sample_pred}, Label={sample_label}, Angular Error={sample_ang_error:.4f} deg, Chordal Loss={sample_chordal:.4f}"
         writer.add_text(f'Samples/Val_Sample_{i+1}', text_str, global_step)
         writer.add_scalar(f'Samples/Sample_{i+1}/Angular_Error', sample_ang_error, global_step)
         writer.add_scalar(f'Samples/Sample_{i+1}/Chordal_Loss', sample_chordal, global_step)
 
-    plot_results(preds, labels_list, global_step, output_dir, dataset_mean, dataset_std)  # Assuming output_dir is global or passed
+    plot_results(preds, labels_list, global_step, output_dir, dataset_mean, dataset_std)
     return total_loss / len(loader), preds, labels_list
 
 def main(args):
     torch._dynamo.config.suppress_errors = True
 
-    # Setup logging
-    global logger  # For access in other functions if needed
     logger = logging.getLogger('rotation_training')
     logger.setLevel(logging.INFO)
     handler = RotatingFileHandler('train_rotation_detailed.log', maxBytes=10*1024*1024, backupCount=5)
@@ -215,7 +242,6 @@ def main(args):
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     
-    # Log setup info
     logger.info(f"Starting training with args: {args}")
     logger.info(f"Device: {device}")
     logger.info(f"PyTorch version: {torch.__version__}, CUDA available: {torch.cuda.is_available()}")
@@ -236,17 +262,17 @@ def main(args):
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     model = DinoV2RotationTransformer().to(device)
-    model.encoder.gradient_checkpointing = True  # Save memory
+    model.encoder.gradient_checkpointing = True
     
-    # Disabled due to compilation errors (e.g., dtype mismatches); re-enable if fixed
-    # model = torch.compile(model)
+    # Freeze encoder initially
+    for param in model.encoder.parameters():
+        param.requires_grad = False
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)  # Simple fixed LR
     criterion = RotationLoss(angular_weight=0.1)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=500)
     scaler = amp.GradScaler()
 
-    global output_dir  # For plot_results access
+    global output_dir
     output_dir = f"./rotation_training_runs/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     os.makedirs(output_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=os.path.join(output_dir, 'logs'))
@@ -256,75 +282,71 @@ def main(args):
     with tqdm(total=args.total_steps, desc="Training Steps") as pbar:
         while global_step < args.total_steps:
             try:
-                img1, img2, img3, delta_p1_p2, labels = next(train_iter)
+                img1, img2, img3, input_abs, abs_p3 = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
-                img1, img2, img3, delta_p1_p2, labels = next(train_iter)
+                img1, img2, img3, input_abs, abs_p3 = next(train_iter)
 
-            img1, img2, img3, delta_p1_p2, labels = img1.to(device), img2.to(device), img3.to(device), delta_p1_p2.to(device), labels.to(device)
+            img1, img2, img3, input_abs, abs_p3 = img1.to(device), img2.to(device), img3.to(device), input_abs.to(device), abs_p3.to(device)
 
             model.train()
             optimizer.zero_grad()
             
             start_time = time.time()
-            with amp.autocast(device_type='cuda'):  # Keep for model forward (efficient)
-                outputs = model(img1, img2, img3, delta_p1_p2)
-            loss = criterion(outputs, labels)  # Compute loss OUTSIDE autocast for fp32 safety
+            with amp.autocast(device_type='cuda'):
+                outputs = model(img1, img2, img3, input_abs)
+            loss = criterion(outputs, abs_p3)
             if torch.isnan(loss):
                 logger.warning(f"NaN loss detected at step {global_step}!")
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+            
             batch_time = time.time() - start_time
 
             writer.add_scalar('Loss/train', loss.item(), global_step)
             
-            # Log per-step
             logger.info(f"Step {global_step}, Train Loss: {loss.item():.4f}")
             
-            # Every 100 steps: Grad norm, LR, timing
             if global_step % 100 == 0:
                 grad_norm = torch.norm(torch.cat([p.grad.data.view(-1) for p in model.parameters() if p.grad is not None]))
-                logger.info(f"Step {global_step}, Grad Norm: {grad_norm:.4f}, Learning Rate: {optimizer.param_groups[0]['lr']:.6f}, Batch Time: {batch_time:.2f} sec")
+                logger.info(f"Step {global_step}, Grad Norm: {grad_norm:.4f}, Learning Rate: {args.lr:.6f}, Batch Time: {batch_time:.2f} sec")  # Fixed LR logged
                 writer.add_scalar('Grad/Norm', grad_norm, global_step)
             
-            # Every 500 steps: Log 1 random train sample for debug
             if global_step % 500 == 0 and global_step > 0:
                 sample_idx = random.randint(0, len(outputs) - 1)
-                sample_delta = delta_p1_p2[sample_idx].cpu().numpy()[:3]
+                sample_input = input_abs[sample_idx].cpu().numpy()[:6]
                 sample_pred = outputs[sample_idx].cpu().detach().numpy()[:3]
-                sample_label = labels[sample_idx].cpu().numpy()[:3]
-                sample_ang_error = angular_distance(outputs[sample_idx].unsqueeze(0), labels[sample_idx].unsqueeze(0)).item()
-                logger.info(f"Train Sample (step {global_step}, idx {sample_idx}): Delta_p1_p2={sample_delta.tolist()}, Pred={sample_pred.tolist()}, Label={sample_label.tolist()}, Angular Error={sample_ang_error:.4f} deg")
-                text_str = f"Train Sample: Delta_p1_p2={sample_delta}, Pred={sample_pred}, Label={sample_label}, Angular Error={sample_ang_error:.4f} deg"
+                sample_label = abs_p3[sample_idx].cpu().numpy()[:3]
+                sample_ang_error = angular_distance(outputs[sample_idx].unsqueeze(0), abs_p3[sample_idx].unsqueeze(0)).item()
+                logger.info(f"Train Sample (step {global_step}, idx {sample_idx}): Input_Abs_p1_p2={sample_input.tolist()}, Pred={sample_pred.tolist()}, Label={sample_label.tolist()}, Angular Error={sample_ang_error:.4f} deg")
+                text_str = f"Train Sample: Input_Abs_p1_p2={sample_input}, Pred={sample_pred}, Label={sample_label}, Angular Error={sample_ang_error:.4f} deg"
                 writer.add_text('Samples/Train_Sample', text_str, global_step)
+
+            # Unfreeze encoder after 2000 steps
+            if global_step == 2000:
+                for param in model.encoder.parameters():
+                    param.requires_grad = True
+                logger.info("Unfreezing encoder at step 2000")
 
             global_step += 1
             pbar.update(1)
 
             if global_step % args.val_freq == 0 or global_step == args.total_steps:
                 val_loss, preds, val_labels = eval_epoch(model, val_loader, criterion, writer, global_step, val_dataset.mean, val_dataset.std)
-                writer.add_scalar('Loss/val', val_loss, global_step)  # Already in eval_epoch, but kept for completeness
+                writer.add_scalar('Loss/val', val_loss, global_step)
                 logger.info(f"Step {global_step}, Val Loss: {val_loss:.4f}")
-                scheduler.step(val_loss)
-                writer.add_scalar('LR', optimizer.param_groups[0]['lr'], global_step)
 
-            if global_step % args.checkpoint_freq == 0 or global_step == args.total_steps:
-                torch.save(model.state_dict(), os.path.join(output_dir, f"model_step_{global_step}.pth"))
-
-    writer.close()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_root', default='./ct_data_rotation_only')
-    parser.add_argument('--total_steps', default=500000, type=int)
-    parser.add_argument('--batch_size', default=16, type=int)
-    parser.add_argument('--lr', default=1e-5, type=float)
-    parser.add_argument('--pairs_per_patient', default=2000, type=int)
-    parser.add_argument('--val_pairs', default=500, type=int)
-    parser.add_argument('--checkpoint_freq', default=10000, type=int)
-    parser.add_argument('--val_freq', default=1000, type=int)
+    parser.add_argument('--data_root', type=str, default='../ct_data_rotation_only')
+    parser.add_argument('--lr', type=float, default=1e-5, help='Fixed learning rate')
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--total_steps', type=int, default=100000)
+    parser.add_argument('--val_freq', type=int, default=1000)
+    parser.add_argument('--pairs_per_patient', type=int, default=2000)
+    parser.add_argument('--val_pairs', type=int, default=500)
     parser.add_argument('--single_patient', action='store_true')
     args = parser.parse_args()
     main(args)
